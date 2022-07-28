@@ -652,6 +652,13 @@ where
     }
 }
 
+// i think this got removed, but im putting it back so i can build my project
+macro_rules! CubicExt {
+    ($c0:expr, $c1:expr, $c2:expr) => {
+        CubicExtField{c0: c0, c1: c1, c2: c2}
+    };
+}
+
 #[cfg(test)]
 mod cube_ext_tests {
     use super::*;

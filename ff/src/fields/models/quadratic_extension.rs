@@ -766,6 +766,14 @@ where
     }
 }
 
+// i think this got removed, but im putting it back so i can build my project
+macro_rules! QuadExt {
+    ($c0:expr, $c1:expr) => {
+        QuadExtField{c0: c0, c1: c1}
+    };
+}
+
+
 #[cfg(test)]
 mod quad_ext_tests {
     use super::*;
