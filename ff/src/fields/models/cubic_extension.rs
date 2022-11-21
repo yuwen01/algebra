@@ -1,6 +1,6 @@
 use ark_serialize::{
     CanonicalDeserialize, CanonicalDeserializeWithFlags, CanonicalSerialize,
-    CanonicalSerializeWithFlags, EmptyFlags, Flags, SerializationError,
+    CanonicalSerializeWithFlags, Compress, EmptyFlags, Flags, SerializationError, Valid, Validate,
 };
 use ark_std::{
     cmp::{Ord, Ordering, PartialOrd},
@@ -34,7 +34,7 @@ pub trait CubicExtConfig: 'static + Send + Sync + Sized {
     /// we might see `BaseField == BasePrimeField`, it won't always hold true.
     /// E.g. for an extension tower: `BasePrimeField == Fp`, but `BaseField == Fp2`.
     type BaseField: Field<BasePrimeField = Self::BasePrimeField>;
-    /// The type of the coefficients for an efficient implemntation of the
+    /// The type of the coefficients for an efficient implementation of the
     /// Frobenius endomorphism.
     type FrobCoeff: Field;
 
@@ -54,8 +54,17 @@ pub trait CubicExtConfig: 'static + Send + Sync + Sized {
     /// A specializable method for multiplying an element of the base field by
     /// the quadratic non-residue. This is used in multiplication and squaring.
     #[inline(always)]
-    fn mul_base_field_by_nonresidue(fe: &Self::BaseField) -> Self::BaseField {
-        Self::NONRESIDUE * fe
+    fn mul_base_field_by_nonresidue_in_place(fe: &mut Self::BaseField) -> &mut Self::BaseField {
+        *fe *= &Self::NONRESIDUE;
+        fe
+    }
+
+    /// A defaulted method for multiplying an element of the base field by
+    /// the quadratic non-residue. This is used in multiplication and squaring.
+    #[inline(always)]
+    fn mul_base_field_by_nonresidue(mut fe: Self::BaseField) -> Self::BaseField {
+        Self::mul_base_field_by_nonresidue_in_place(&mut fe);
+        fe
     }
 
     /// A specializable method for multiplying an element of the base field by
@@ -209,6 +218,13 @@ impl<P: CubicExtConfig> Field for CubicExtField<P> {
         self
     }
 
+    fn neg_in_place(&mut self) -> &mut Self {
+        self.c0.neg_in_place();
+        self.c1.neg_in_place();
+        self.c2.neg_in_place();
+        self
+    }
+
     #[inline]
     fn from_random_bytes_with_flags<F: Flags>(bytes: &[u8]) -> Option<(Self, F)> {
         let split_at = bytes.len() / 3;
@@ -251,8 +267,16 @@ impl<P: CubicExtConfig> Field for CubicExtField<P> {
         let s3 = bc.double();
         let s4 = c.square();
 
-        self.c0 = s0 + &P::mul_base_field_by_nonresidue(&s3);
-        self.c1 = s1 + &P::mul_base_field_by_nonresidue(&s4);
+        // c0 = s0 + s3 * NON_RESIDUE
+        self.c0 = s3;
+        P::mul_base_field_by_nonresidue_in_place(&mut self.c0);
+        self.c0 += &s0;
+
+        // c1 = s1 + s4 * NON_RESIDUE
+        self.c1 = s4;
+        P::mul_base_field_by_nonresidue_in_place(&mut self.c1);
+        self.c1 += &s1;
+
         self.c2 = s1 + &s2 + &s3 - &s0 - &s4;
         self
     }
@@ -275,16 +299,16 @@ impl<P: CubicExtConfig> Field for CubicExtField<P> {
             let t3 = self.c0 * &self.c1;
             let t4 = self.c0 * &self.c2;
             let t5 = self.c1 * &self.c2;
-            let n5 = P::mul_base_field_by_nonresidue(&t5);
+            let n5 = P::mul_base_field_by_nonresidue(t5);
 
             let s0 = t0 - &n5;
-            let s1 = P::mul_base_field_by_nonresidue(&t2) - &t3;
+            let s1 = P::mul_base_field_by_nonresidue(t2) - &t3;
             let s2 = t1 - &t4; // typo in paper referenced above. should be "-" as per Scott, but is "*"
 
             let a1 = self.c2 * &s1;
             let a2 = self.c1 * &s2;
             let mut a3 = a1 + &a2;
-            a3 = P::mul_base_field_by_nonresidue(&a3);
+            a3 = P::mul_base_field_by_nonresidue(a3);
             let t6 = (self.c0 * &s0 + &a3).inverse().unwrap();
 
             let c0 = t6 * &s0;
@@ -458,9 +482,9 @@ impl<P: CubicExtConfig> Neg for CubicExtField<P> {
     type Output = Self;
     #[inline]
     fn neg(mut self) -> Self {
-        self.c0 = -self.c0;
-        self.c1 = -self.c1;
-        self.c2 = -self.c2;
+        self.c0.neg_in_place();
+        self.c1.neg_in_place();
+        self.c2.neg_in_place();
         self
     }
 }
@@ -560,8 +584,8 @@ impl<'a, P: CubicExtConfig> MulAssign<&'a Self> for CubicExtField<P> {
         let y = (d + &e) * &(a + &b) - &ad - &be;
         let z = (d + &f) * &(a + &c) - &ad + &be - &cf;
 
-        self.c0 = ad + &P::mul_base_field_by_nonresidue(&x);
-        self.c1 = y + &P::mul_base_field_by_nonresidue(&cf);
+        self.c0 = ad + &P::mul_base_field_by_nonresidue(x);
+        self.c1 = y + &P::mul_base_field_by_nonresidue(cf);
         self.c2 = z;
     }
 }
@@ -586,28 +610,32 @@ impl<P: CubicExtConfig> CanonicalSerializeWithFlags for CubicExtField<P> {
         mut writer: W,
         flags: F,
     ) -> Result<(), SerializationError> {
-        self.c0.serialize(&mut writer)?;
-        self.c1.serialize(&mut writer)?;
+        self.c0.serialize_compressed(&mut writer)?;
+        self.c1.serialize_compressed(&mut writer)?;
         self.c2.serialize_with_flags(&mut writer, flags)?;
         Ok(())
     }
 
     #[inline]
     fn serialized_size_with_flags<F: Flags>(&self) -> usize {
-        self.c0.serialized_size()
-            + self.c1.serialized_size()
+        self.c0.compressed_size()
+            + self.c1.compressed_size()
             + self.c2.serialized_size_with_flags::<F>()
     }
 }
 
 impl<P: CubicExtConfig> CanonicalSerialize for CubicExtField<P> {
     #[inline]
-    fn serialize<W: Write>(&self, writer: W) -> Result<(), SerializationError> {
+    fn serialize_with_mode<W: Write>(
+        &self,
+        writer: W,
+        _compress: Compress,
+    ) -> Result<(), SerializationError> {
         self.serialize_with_flags(writer, EmptyFlags)
     }
 
     #[inline]
-    fn serialized_size(&self) -> usize {
+    fn serialized_size(&self, _compress: Compress) -> usize {
         self.serialized_size_with_flags::<EmptyFlags>()
     }
 }
@@ -617,19 +645,34 @@ impl<P: CubicExtConfig> CanonicalDeserializeWithFlags for CubicExtField<P> {
     fn deserialize_with_flags<R: Read, F: Flags>(
         mut reader: R,
     ) -> Result<(Self, F), SerializationError> {
-        let c0 = CanonicalDeserialize::deserialize(&mut reader)?;
-        let c1 = CanonicalDeserialize::deserialize(&mut reader)?;
+        let c0 = CanonicalDeserialize::deserialize_compressed(&mut reader)?;
+        let c1 = CanonicalDeserialize::deserialize_compressed(&mut reader)?;
         let (c2, flags) = CanonicalDeserializeWithFlags::deserialize_with_flags(&mut reader)?;
         Ok((CubicExtField::new(c0, c1, c2), flags))
     }
 }
 
+impl<P: CubicExtConfig> Valid for CubicExtField<P> {
+    fn check(&self) -> Result<(), SerializationError> {
+        self.c0.check()?;
+        self.c1.check()?;
+        self.c2.check()
+    }
+}
+
 impl<P: CubicExtConfig> CanonicalDeserialize for CubicExtField<P> {
     #[inline]
-    fn deserialize<R: Read>(mut reader: R) -> Result<Self, SerializationError> {
-        let c0: P::BaseField = CanonicalDeserialize::deserialize(&mut reader)?;
-        let c1: P::BaseField = CanonicalDeserialize::deserialize(&mut reader)?;
-        let c2: P::BaseField = CanonicalDeserialize::deserialize(&mut reader)?;
+    fn deserialize_with_mode<R: Read>(
+        mut reader: R,
+        compress: Compress,
+        validate: Validate,
+    ) -> Result<Self, SerializationError> {
+        let c0: P::BaseField =
+            CanonicalDeserialize::deserialize_with_mode(&mut reader, compress, validate)?;
+        let c1: P::BaseField =
+            CanonicalDeserialize::deserialize_with_mode(&mut reader, compress, validate)?;
+        let c2: P::BaseField =
+            CanonicalDeserialize::deserialize_with_mode(&mut reader, compress, validate)?;
         Ok(CubicExtField::new(c0, c1, c2))
     }
 }

@@ -2,11 +2,11 @@ use core::ops::Neg;
 
 use crate::bls12_381::*;
 use ark_ec::{
-    bls12,
+    bls12::{self, Bls12Parameters},
     hashing::curve_maps::wb::WBParams,
     models::CurveConfig,
     short_weierstrass::{self, *},
-    AffineCurve, ProjectiveCurve,
+    AffineRepr, CurveGroup, Group,
 };
 use ark_ff::{BigInt, Field, MontFp, Zero};
 
@@ -54,7 +54,7 @@ impl short_weierstrass::SWCurveConfig for Parameters {
     const GENERATOR: G2Affine = G2Affine::new_unchecked(G2_GENERATOR_X, G2_GENERATOR_Y);
 
     #[inline(always)]
-    fn mul_by_a(_: &Self::BaseField) -> Self::BaseField {
+    fn mul_by_a(_: Self::BaseField) -> Self::BaseField {
         Self::BaseField::zero()
     }
 
@@ -64,7 +64,7 @@ impl short_weierstrass::SWCurveConfig for Parameters {
         // Checks that [p]P = [X]P
 
         let mut x_times_point =
-            point.mul(BigInt::new([crate::bls12_381::Parameters::X[0], 0, 0, 0]));
+            point.mul_bigint(BigInt::new([crate::bls12_381::Parameters::X[0], 0, 0, 0]));
         if crate::bls12_381::Parameters::X_IS_NEGATIVE {
             x_times_point = -x_times_point;
         }
@@ -84,27 +84,22 @@ impl short_weierstrass::SWCurveConfig for Parameters {
         // more efficient, since the scalar -c1 has less limbs and a much lower Hamming
         // weight.
         let x: &'static [u64] = crate::bls12_381::Parameters::X;
-        let p_projective = p.into_projective();
+        let p_projective = p.into_group();
 
         // [x]P
-        let x_p = Parameters::mul_affine(p, &x).neg();
+        let x_p = Parameters::mul_affine(p, x).neg();
         // ψ(P)
-        let psi_p = p_power_endomorphism(&p);
+        let psi_p = p_power_endomorphism(p);
         // (ψ^2)(2P)
         let mut psi2_p2 = double_p_power_endomorphism(&p_projective.double());
 
-        // tmp = [x]P + ψ(P)
-        let mut tmp = x_p.clone();
-        tmp.add_assign_mixed(&psi_p);
-
-        // tmp2 = [x^2]P + [x]ψ(P)
-        let mut tmp2: Projective<Parameters> = tmp;
-        tmp2 = tmp2.mul(x).neg();
+        // tmp = [x^2]P + [x]ψ(P)
+        let tmp = (x_p + psi_p).mul_bigint(x).neg();
 
         // add up all the terms
-        psi2_p2 += tmp2;
+        psi2_p2 += tmp;
         psi2_p2 -= x_p;
-        psi2_p2.add_assign_mixed(&-psi_p);
+        psi2_p2 -= psi_p;
         (psi2_p2 - p_projective).into_affine()
     }
 }
@@ -174,8 +169,8 @@ pub fn p_power_endomorphism(p: &Affine<Parameters>) -> Affine<Parameters> {
     res.y.frobenius_map(1);
 
     let tmp_x = res.x;
-    res.x.c0 = -P_POWER_ENDOMORPHISM_COEFF_0.c1 * &tmp_x.c1;
-    res.x.c1 = P_POWER_ENDOMORPHISM_COEFF_0.c1 * &tmp_x.c0;
+    res.x.c0 = -P_POWER_ENDOMORPHISM_COEFF_0.c1 * tmp_x.c1;
+    res.x.c1 = P_POWER_ENDOMORPHISM_COEFF_0.c1 * tmp_x.c0;
     res.y *= P_POWER_ENDOMORPHISM_COEFF_1;
 
     res

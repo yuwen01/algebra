@@ -1,19 +1,16 @@
-use crate::{biginteger::BigInteger, fields::utils::k_adicity, UniformRand};
+use crate::UniformRand;
 use ark_serialize::{
     CanonicalDeserialize, CanonicalDeserializeWithFlags, CanonicalSerialize,
     CanonicalSerializeWithFlags, EmptyFlags, Flags,
 };
 use ark_std::{
-    cmp::min,
     fmt::{Debug, Display},
     hash::Hash,
     ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign},
-    str::FromStr,
     vec::Vec,
 };
 
 pub use ark_ff_macros;
-use num_bigint::BigUint;
 use num_traits::{One, Zero};
 use zeroize::Zeroize;
 
@@ -27,6 +24,18 @@ pub mod models;
 pub use self::models::*;
 
 pub mod field_hashers;
+
+mod prime;
+pub use prime::*;
+
+mod fft_friendly;
+pub use fft_friendly::*;
+
+mod cyclotomic;
+pub use cyclotomic::*;
+
+mod sqrt;
+pub use sqrt::*;
 
 #[cfg(feature = "parallel")]
 use ark_std::cmp::max;
@@ -48,6 +57,7 @@ use rayon::prelude::*;
 /// pub struct FqConfig;
 /// pub type Fq = Fp64<MontBackend<FqConfig, 1>>;
 ///
+/// # fn main() {
 /// let a = Fq::from(9);
 /// let b = Fq::from(10);
 ///
@@ -58,6 +68,7 @@ use rayon::prelude::*;
 /// assert_eq!(a.square(), Fq::from(13)); // 81 = 13 mod 17
 /// assert_eq!(b.double(), Fq::from(3));  // 20 =  3 mod 17
 /// assert_eq!(a / b, a * b.inverse().unwrap()); // need to unwrap since `b` could be 0 which is not invertible
+/// # }
 /// ```
 ///
 /// ## Using pre-defined fields
@@ -118,6 +129,14 @@ pub trait Field:
     + for<'a> SubAssign<&'a Self>
     + for<'a> MulAssign<&'a Self>
     + for<'a> DivAssign<&'a Self>
+    + for<'a> Add<&'a mut Self, Output = Self>
+    + for<'a> Sub<&'a mut Self, Output = Self>
+    + for<'a> Mul<&'a mut Self, Output = Self>
+    + for<'a> Div<&'a mut Self, Output = Self>
+    + for<'a> AddAssign<&'a mut Self>
+    + for<'a> SubAssign<&'a mut Self>
+    + for<'a> MulAssign<&'a mut Self>
+    + for<'a> DivAssign<&'a mut Self>
     + core::iter::Sum<Self>
     + for<'a> core::iter::Sum<&'a Self>
     + core::iter::Product<Self>
@@ -174,6 +193,9 @@ pub trait Field:
     /// Doubles `self` in place.
     fn double_in_place(&mut self) -> &mut Self;
 
+    /// Negates `self` in place.
+    fn neg_in_place(&mut self) -> &mut Self;
+
     /// Attempt to deserialize a field element. Returns `None` if the
     /// deserialization fails.
     ///
@@ -229,6 +251,16 @@ pub trait Field:
     /// `self` to `self.inverse().unwrap()`.
     fn inverse_in_place(&mut self) -> Option<&mut Self>;
 
+    /// Returns `sum([a_i * b_i])`.
+    #[inline]
+    fn sum_of_products<const T: usize>(a: &[Self; T], b: &[Self; T]) -> Self {
+        let mut sum = Self::zero();
+        for i in 0..a.len() {
+            sum += a[i] * b[i];
+        }
+        sum
+    }
+
     /// Exponentiates this element by a power of the base prime modulus via
     /// the Frobenius automorphism.
     fn frobenius_map(&mut self, power: usize);
@@ -239,7 +271,7 @@ pub trait Field:
     fn pow<S: AsRef<[u64]>>(&self, exp: S) -> Self {
         let mut res = Self::one();
 
-        for i in BitIteratorBE::without_leading_zeros(exp) {
+        for i in crate::BitIteratorBE::without_leading_zeros(exp) {
             res.square_in_place();
 
             if i {
@@ -259,400 +291,12 @@ pub trait Field:
     #[inline]
     fn pow_with_table<S: AsRef<[u64]>>(powers_of_2: &[Self], exp: S) -> Option<Self> {
         let mut res = Self::one();
-        for (pow, bit) in BitIteratorLE::without_trailing_zeros(exp).enumerate() {
+        for (pow, bit) in crate::BitIteratorLE::without_trailing_zeros(exp).enumerate() {
             if bit {
                 res *= powers_of_2.get(pow)?;
             }
         }
         Some(res)
-    }
-}
-
-/// The interface for fields that are able to be used in FFTs.
-pub trait FftField: Field {
-    /// The generator of the multiplicative group of the field
-    const GENERATOR: Self;
-
-    /// Let `N` be the size of the multiplicative group defined by the field.
-    /// Then `TWO_ADICITY` is the two-adicity of `N`, i.e. the integer `s`
-    /// such that `N = 2^s * t` for some odd integer `t`.
-    const TWO_ADICITY: u32;
-
-    /// 2^s root of unity computed by GENERATOR^t
-    const TWO_ADIC_ROOT_OF_UNITY: Self;
-
-    /// An integer `b` such that there exists a multiplicative subgroup
-    /// of size `b^k` for some integer `k`.
-    const SMALL_SUBGROUP_BASE: Option<u32> = None;
-
-    /// The integer `k` such that there exists a multiplicative subgroup
-    /// of size `Self::SMALL_SUBGROUP_BASE^k`.
-    const SMALL_SUBGROUP_BASE_ADICITY: Option<u32> = None;
-
-    /// GENERATOR^((MODULUS-1) / (2^s *
-    /// SMALL_SUBGROUP_BASE^SMALL_SUBGROUP_BASE_ADICITY)) Used for mixed-radix
-    /// FFT.
-    const LARGE_SUBGROUP_ROOT_OF_UNITY: Option<Self> = None;
-
-    /// Returns the root of unity of order n, if one exists.
-    /// If no small multiplicative subgroup is defined, this is the 2-adic root
-    /// of unity of order n (for n a power of 2).
-    /// If a small multiplicative subgroup is defined, this is the root of unity
-    /// of order n for the larger subgroup generated by
-    /// `FftConfig::LARGE_SUBGROUP_ROOT_OF_UNITY`
-    /// (for n = 2^i * FftConfig::SMALL_SUBGROUP_BASE^j for some i, j).
-    fn get_root_of_unity(n: u64) -> Option<Self> {
-        let mut omega: Self;
-        if let Some(large_subgroup_root_of_unity) = Self::LARGE_SUBGROUP_ROOT_OF_UNITY {
-            let q = Self::SMALL_SUBGROUP_BASE.expect(
-                "LARGE_SUBGROUP_ROOT_OF_UNITY should only be set in conjunction with SMALL_SUBGROUP_BASE",
-            ) as u64;
-            let small_subgroup_base_adicity = Self::SMALL_SUBGROUP_BASE_ADICITY.expect(
-                "LARGE_SUBGROUP_ROOT_OF_UNITY should only be set in conjunction with SMALL_SUBGROUP_BASE_ADICITY",
-            );
-
-            let q_adicity = k_adicity(q, n);
-            let q_part = q.checked_pow(q_adicity)?;
-
-            let two_adicity = k_adicity(2, n);
-            let two_part = 2u64.checked_pow(two_adicity)?;
-
-            if n != two_part * q_part
-                || (two_adicity > Self::TWO_ADICITY)
-                || (q_adicity > small_subgroup_base_adicity)
-            {
-                return None;
-            }
-
-            omega = large_subgroup_root_of_unity;
-            for _ in q_adicity..small_subgroup_base_adicity {
-                omega = omega.pow(&[q as u64]);
-            }
-
-            for _ in two_adicity..Self::TWO_ADICITY {
-                omega.square_in_place();
-            }
-        } else {
-            // Compute the next power of 2.
-            let size = n.next_power_of_two() as u64;
-            let log_size_of_group = ark_std::log2(usize::try_from(size).expect("too large"));
-
-            if n != size || log_size_of_group > Self::TWO_ADICITY {
-                return None;
-            }
-
-            // Compute the generator for the multiplicative subgroup.
-            // It should be 2^(log_size_of_group) root of unity.
-            omega = Self::TWO_ADIC_ROOT_OF_UNITY;
-            for _ in log_size_of_group..Self::TWO_ADICITY {
-                omega.square_in_place();
-            }
-        }
-        Some(omega)
-    }
-}
-
-/// The interface for a prime field, i.e. the field of integers modulo a prime $p$.  
-/// In the following example we'll use the prime field underlying the BLS12-381 G1 curve.
-/// ```rust
-/// use ark_ff::{Field, PrimeField, BigInteger};
-/// use ark_test_curves::bls12_381::Fq as F;
-/// use ark_std::{One, Zero, UniformRand, test_rng};
-///
-/// let mut rng = test_rng();
-/// let a = F::rand(&mut rng);
-/// // We can access the prime modulus associated with `F`:
-/// let modulus = <F as PrimeField>::MODULUS;
-/// assert_eq!(a.pow(&modulus), a); // the Euler-Fermat theorem tells us: a^{p-1} = 1 mod p
-///
-/// // We can convert field elements to integers in the range [0, MODULUS - 1]:
-/// let one: num_bigint::BigUint = F::one().into();
-/// assert_eq!(one, num_bigint::BigUint::one());
-///
-/// // We can construct field elements from an arbitrary sequence of bytes:
-/// let n = F::from_le_bytes_mod_order(&modulus.to_bytes_le());
-/// assert_eq!(n, F::zero());
-/// ```
-pub trait PrimeField:
-    Field<BasePrimeField = Self>
-    + FftField
-    + FromStr
-    + From<<Self as PrimeField>::BigInt>
-    + Into<<Self as PrimeField>::BigInt>
-    + From<BigUint>
-    + Into<BigUint>
-{
-    /// A `BigInteger` type that can represent elements of this field.
-    type BigInt: BigInteger;
-
-    /// The modulus `p`.
-    const MODULUS: Self::BigInt;
-
-    /// The value `(p - 1)/ 2`.
-    const MODULUS_MINUS_ONE_DIV_TWO: Self::BigInt;
-
-    /// The size of the modulus in bits.
-    const MODULUS_BIT_SIZE: u32;
-
-    /// The trace of the field is defined as the smallest integer `t` such that by
-    /// `2^s * t = p - 1`, and `t` is coprime to 2.
-    const TRACE: Self::BigInt;
-    /// The value `(t - 1)/ 2`.
-    const TRACE_MINUS_ONE_DIV_TWO: Self::BigInt;
-
-    /// Construct a prime field element from an integer in the range 0..(p - 1).
-    fn from_bigint(repr: Self::BigInt) -> Option<Self>;
-
-    /// Converts an element of the prime field into an integer in the range 0..(p - 1).
-    fn into_bigint(self) -> Self::BigInt;
-
-    /// Reads bytes in big-endian, and converts them to a field element.
-    /// If the integer represented by `bytes` is larger than the modulus `p`, this method
-    /// performs the appropriate reduction.
-    fn from_be_bytes_mod_order(bytes: &[u8]) -> Self {
-        let num_modulus_bytes = ((Self::MODULUS_BIT_SIZE + 7) / 8) as usize;
-        let num_bytes_to_directly_convert = min(num_modulus_bytes - 1, bytes.len());
-        // Copy the leading big-endian bytes directly into a field element.
-        // The number of bytes directly converted must be less than the
-        // number of bytes needed to represent the modulus, as we must begin
-        // modular reduction once the data is of the same number of bytes as the
-        // modulus.
-        let mut bytes_to_directly_convert = Vec::new();
-        bytes_to_directly_convert.extend(bytes[..num_bytes_to_directly_convert].iter().rev());
-        // Guaranteed to not be None, as the input is less than the modulus size.
-        let mut res = Self::from_random_bytes(&bytes_to_directly_convert).unwrap();
-
-        // Update the result, byte by byte.
-        // We go through existing field arithmetic, which handles the reduction.
-        // TODO: If we need higher speeds, parse more bytes at once, or implement
-        // modular multiplication by a u64
-        let window_size = Self::from(256u64);
-        for byte in bytes[num_bytes_to_directly_convert..].iter() {
-            res *= window_size;
-            res += Self::from(*byte);
-        }
-        res
-    }
-
-    /// Reads bytes in little-endian, and converts them to a field element.
-    /// If the integer represented by `bytes` is larger than the modulus `p`, this method
-    /// performs the appropriate reduction.
-    fn from_le_bytes_mod_order(bytes: &[u8]) -> Self {
-        let mut bytes_copy = bytes.to_vec();
-        bytes_copy.reverse();
-        Self::from_be_bytes_mod_order(&bytes_copy)
-    }
-}
-
-/// Indication of the field element's quadratic residuosity
-///
-/// # Examples
-/// ```
-/// # use ark_std::test_rng;
-/// # use ark_std::UniformRand;
-/// # use ark_test_curves::{LegendreSymbol, Field, bls12_381::Fq as Fp};
-/// let a: Fp = Fp::rand(&mut test_rng());
-/// let b = a.square();
-/// assert_eq!(b.legendre(), LegendreSymbol::QuadraticResidue);
-/// ```
-#[derive(Debug, PartialEq)]
-pub enum LegendreSymbol {
-    Zero = 0,
-    QuadraticResidue = 1,
-    QuadraticNonResidue = -1,
-}
-
-impl LegendreSymbol {
-    /// Returns true if `self.is_zero()`.
-    ///
-    /// # Examples
-    /// ```
-    /// # use ark_std::test_rng;
-    /// # use ark_std::UniformRand;
-    /// # use ark_test_curves::{LegendreSymbol, Field, bls12_381::Fq as Fp};
-    /// let a: Fp = Fp::rand(&mut test_rng());
-    /// let b: Fp = a.square();
-    /// assert!(!b.legendre().is_zero());
-    /// ```
-    pub fn is_zero(&self) -> bool {
-        *self == LegendreSymbol::Zero
-    }
-
-    /// Returns true if `self` is a quadratic non-residue.
-    ///
-    /// # Examples
-    /// ```
-    /// # use ark_test_curves::{Fp2Config, Field, LegendreSymbol, bls12_381::{Fq, Fq2Config}};
-    /// let a: Fq = Fq2Config::NONRESIDUE;
-    /// assert!(a.legendre().is_qnr());
-    /// ```
-    pub fn is_qnr(&self) -> bool {
-        *self == LegendreSymbol::QuadraticNonResidue
-    }
-
-    /// Returns true if `self` is a quadratic residue.
-    /// # Examples
-    /// ```
-    /// # use ark_std::test_rng;
-    /// # use ark_test_curves::bls12_381::Fq as Fp;
-    /// # use ark_std::UniformRand;
-    /// # use ark_ff::{LegendreSymbol, Field};
-    /// let a: Fp = Fp::rand(&mut test_rng());
-    /// let b: Fp = a.square();
-    /// assert!(b.legendre().is_qr());
-    /// ```
-    pub fn is_qr(&self) -> bool {
-        *self == LegendreSymbol::QuadraticResidue
-    }
-}
-
-#[non_exhaustive]
-pub enum SqrtPrecomputation<F: Field> {
-    // Tonelli-Shanks algorithm works for all elements, no matter what the modulus is.
-    TonelliShanks(u32, &'static dyn AsRef<[u64]>, F),
-}
-
-impl<F: Field> SqrtPrecomputation<F> {
-    fn sqrt(&self, elem: &F) -> Option<F> {
-        match self {
-            SqrtPrecomputation::TonelliShanks(two_adicity, trace_minus_one_div_two, qnr_to_t) => {
-                // https://eprint.iacr.org/2012/685.pdf (page 12, algorithm 5)
-                // Actually this is just normal Tonelli-Shanks; since `P::Generator`
-                // is a quadratic non-residue, `P::ROOT_OF_UNITY = P::GENERATOR ^ t`
-                // is also a quadratic non-residue (since `t` is odd).
-                if elem.is_zero() {
-                    return Some(F::zero());
-                }
-                // Try computing the square root (x at the end of the algorithm)
-                // Check at the end of the algorithm if x was a square root
-                // Begin Tonelli-Shanks
-                let mut z = *qnr_to_t;
-                let mut w = elem.pow(trace_minus_one_div_two);
-                let mut x = w * elem;
-                let mut b = x * &w;
-
-                let mut v = *two_adicity as usize;
-
-                while !b.is_one() {
-                    let mut k = 0usize;
-
-                    let mut b2k = b;
-                    while !b2k.is_one() {
-                        // invariant: b2k = b^(2^k) after entering this loop
-                        b2k.square_in_place();
-                        k += 1;
-                    }
-
-                    if k == (*two_adicity as usize) {
-                        // We are in the case where self^(T * 2^k) = x^(P::MODULUS - 1) = 1,
-                        // which means that no square root exists.
-                        return None;
-                    }
-                    let j = v - k;
-                    w = z;
-                    for _ in 1..j {
-                        w.square_in_place();
-                    }
-
-                    z = w.square();
-                    b *= &z;
-                    x *= &w;
-                    v = k;
-                }
-                // Is x the square root? If so, return it.
-                if x.square() == *elem {
-                    return Some(x);
-                } else {
-                    // Consistency check that if no square root is found,
-                    // it is because none exists.
-                    debug_assert!(!matches!(elem.legendre(), LegendreSymbol::QuadraticResidue));
-                    None
-                }
-            },
-        }
-    }
-}
-
-/// Iterates over a slice of `u64` in *big-endian* order.
-#[derive(Debug)]
-pub struct BitIteratorBE<Slice: AsRef<[u64]>> {
-    s: Slice,
-    n: usize,
-}
-
-impl<Slice: AsRef<[u64]>> BitIteratorBE<Slice> {
-    pub fn new(s: Slice) -> Self {
-        let n = s.as_ref().len() * 64;
-        BitIteratorBE { s, n }
-    }
-
-    /// Construct an iterator that automatically skips any leading zeros.
-    /// That is, it skips all zeros before the most-significant one.
-    pub fn without_leading_zeros(s: Slice) -> impl Iterator<Item = bool> {
-        Self::new(s).skip_while(|b| !b)
-    }
-}
-
-impl<Slice: AsRef<[u64]>> Iterator for BitIteratorBE<Slice> {
-    type Item = bool;
-
-    fn next(&mut self) -> Option<bool> {
-        if self.n == 0 {
-            None
-        } else {
-            self.n -= 1;
-            let part = self.n / 64;
-            let bit = self.n - (64 * part);
-
-            Some(self.s.as_ref()[part] & (1 << bit) > 0)
-        }
-    }
-}
-
-/// Iterates over a slice of `u64` in *little-endian* order.
-#[derive(Debug)]
-pub struct BitIteratorLE<Slice: AsRef<[u64]>> {
-    s: Slice,
-    n: usize,
-    max_len: usize,
-}
-
-impl<Slice: AsRef<[u64]>> BitIteratorLE<Slice> {
-    pub fn new(s: Slice) -> Self {
-        let n = 0;
-        let max_len = s.as_ref().len() * 64;
-        BitIteratorLE { s, n, max_len }
-    }
-
-    /// Construct an iterator that automatically skips any trailing zeros.
-    /// That is, it skips all zeros after the most-significant one.
-    pub fn without_trailing_zeros(s: Slice) -> impl Iterator<Item = bool> {
-        let mut first_trailing_zero = 0;
-        for (i, limb) in s.as_ref().iter().enumerate().rev() {
-            first_trailing_zero = i * 64 + (64 - limb.leading_zeros()) as usize;
-            if *limb != 0 {
-                break;
-            }
-        }
-        let mut iter = Self::new(s);
-        iter.max_len = first_trailing_zero;
-        iter
-    }
-}
-
-impl<Slice: AsRef<[u64]>> Iterator for BitIteratorLE<Slice> {
-    type Item = bool;
-
-    fn next(&mut self) -> Option<bool> {
-        if self.n == self.max_len {
-            None
-        } else {
-            let part = self.n / 64;
-            let bit = self.n - (64 * part);
-            self.n += 1;
-
-            Some(self.s.as_ref()[part] & (1 << bit) > 0)
-        }
     }
 }
 
@@ -723,7 +367,7 @@ fn serial_batch_inversion_and_mul<F: Field>(v: &mut [F], coeff: &F) {
 
 #[cfg(all(test, feature = "std"))]
 mod std_tests {
-    use super::BitIteratorLE;
+    use crate::BitIteratorLE;
 
     #[test]
     fn bit_iterator_le() {
@@ -743,7 +387,9 @@ mod std_tests {
 #[cfg(test)]
 mod no_std_tests {
     use super::*;
-    use ark_std::test_rng;
+    use ark_std::{str::FromStr, test_rng};
+    use num_bigint::*;
+
     // TODO: only Fr & FrConfig should need to be imported.
     // The rest of imports are caused by cargo not resolving the deps properly
     // from this crate and from ark_test_curves

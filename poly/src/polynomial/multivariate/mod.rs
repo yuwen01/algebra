@@ -1,11 +1,10 @@
 //! Work with sparse multivariate polynomials.
 use ark_ff::Field;
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, SerializationError};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::{
     cmp::Ordering,
     fmt::{Debug, Error, Formatter},
     hash::Hash,
-    io::{Read, Write},
     ops::Deref,
     vec::Vec,
 };
@@ -105,7 +104,7 @@ impl Term for SparseTerm {
 
     /// Returns whether `self` is a constant
     fn is_constant(&self) -> bool {
-        self.len() == 0
+        self.len() == 0 || self.degree() == 0
     }
 
     /// Evaluates `self` at the given `point` in the field.

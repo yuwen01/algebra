@@ -2,7 +2,7 @@
 
 use crate::evaluations::multivariate::multilinear::{swap_bits, MultilinearExtension};
 use ark_ff::{Field, Zero};
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Read, SerializationError, Write};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::{
     fmt,
     fmt::Formatter,
@@ -47,23 +47,20 @@ impl<F: Field> DenseMultilinearExtension<F> {
             evaluations,
         }
     }
-    /// Relabel the point inplace by switching `k` scalars from position `a` to
+    /// Relabel the point in place by switching `k` scalars from position `a` to
     /// position `b`, and from position `b` to position `a` in vector.
     ///
     /// This function turns `P(x_1,...,x_a,...,x_{a+k - 1},...,x_b,...,x_{b+k - 1},...,x_n)`
     /// to `P(x_1,...,x_b,...,x_{b+k - 1},...,x_a,...,x_{a+k - 1},...,x_n)`
-    pub fn relabel_inplace(&mut self, mut a: usize, mut b: usize, k: usize) {
+    pub fn relabel_in_place(&mut self, mut a: usize, mut b: usize, k: usize) {
         // enforce order of a and b
         if a > b {
             ark_std::mem::swap(&mut a, &mut b);
         }
-        assert!(
-            a + k < self.num_vars && b + k < self.num_vars,
-            "invalid relabel argument"
-        );
         if a == b || k == 0 {
             return;
         }
+        assert!(b + k <= self.num_vars, "invalid relabel argument");
         assert!(a + k <= b, "overlapped swap window is not allowed");
         for i in 0..self.evaluations.len() {
             let j = swap_bits(i, a, b, k);
@@ -106,7 +103,7 @@ impl<F: Field> MultilinearExtension<F> for DenseMultilinearExtension<F> {
 
     fn relabel(&self, a: usize, b: usize, k: usize) -> Self {
         let mut copied = self.clone();
-        copied.relabel_inplace(a, b, k);
+        copied.relabel_in_place(a, b, k);
         copied
     }
 
@@ -314,26 +311,30 @@ mod tests {
 
             let expected = poly.evaluate(&point);
 
-            poly.relabel_inplace(2, 2, 1); // should have no effect
+            poly.relabel_in_place(2, 2, 1); // should have no effect
             assert_eq!(expected, poly.evaluate(&point));
 
-            poly.relabel_inplace(3, 4, 1); // should switch 3 and 4
+            poly.relabel_in_place(3, 4, 1); // should switch 3 and 4
             point.swap(3, 4);
             assert_eq!(expected, poly.evaluate(&point));
 
-            poly.relabel_inplace(7, 5, 1);
+            poly.relabel_in_place(7, 5, 1);
             point.swap(7, 5);
             assert_eq!(expected, poly.evaluate(&point));
 
-            poly.relabel_inplace(2, 5, 3);
+            poly.relabel_in_place(2, 5, 3);
             point.swap(2, 5);
             point.swap(3, 6);
             point.swap(4, 7);
             assert_eq!(expected, poly.evaluate(&point));
 
-            poly.relabel_inplace(7, 0, 2);
+            poly.relabel_in_place(7, 0, 2);
             point.swap(0, 7);
             point.swap(1, 8);
+            assert_eq!(expected, poly.evaluate(&point));
+
+            poly.relabel_in_place(0, 9, 1);
+            point.swap(0, 9);
             assert_eq!(expected, poly.evaluate(&point));
         }
     }

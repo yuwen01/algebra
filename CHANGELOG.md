@@ -4,13 +4,13 @@
 
 ### Breaking changes
 
-- [\#300](https://github.com/arkworks-rs/algebra/pull/300) (`ark-ec`) Change the implementation of `Hash` trait of `GroupProjective` to use the affine co-ordinates.
+- [\#300](https://github.com/arkworks-rs/algebra/pull/300) (`ark-ec`) Change the implementation of `Hash` trait of `GroupProjective` to use the affine coordinates.
 - [\#302](https://github.com/arkworks-rs/algebra/pull/302) (`ark-ff`) Rename `find_wnaf` to `find_naf`.
 - [\#310](https://github.com/arkworks-rs/algebra/pull/310) (`ark-ec`, `ark-ff`) Remove unnecessary internal `PhantomData`.
 - [\#333](https://github.com/arkworks-rs/algebra/pull/333) (`ark-poly`) Expose more properties of `EvaluationDomain`s.
 - [\#338](https://github.com/arkworks-rs/algebra/pull/338) (`ark-ec`) Add missing `UniformRand` trait bound to `GroupAffine`.
 - [\#338](https://github.com/arkworks-rs/algebra/pull/338) (workspace) Change to Rust 2021 edition.
-- [\#345](https://github.com/arkworks-rs/algebra/pull/345) (`ark-ec`, `ark-serialize`) Change the serialization format for Twisted Edwards Curves. We now encode the Y co-ordinate and take the sign bit of the X co-ordinate, the default flag is also now the Positive X value. The old methods for backwards compatibility are located [here](https://github.com/arkworks-rs/algebra/pull/345/files#diff-3621a48bb33f469144044d8d5fc663f767e103132a764812cda6be6c25877494R860)
+- [\#345](https://github.com/arkworks-rs/algebra/pull/345) (`ark-ec`, `ark-serialize`) Change the serialization format for Twisted Edwards Curves. We now encode the Y coordinate and take the sign bit of the X coordinate, the default flag is also now the Positive X value. The old methods for backwards compatibility are located [here](https://github.com/arkworks-rs/algebra/pull/345/files#diff-3621a48bb33f469144044d8d5fc663f767e103132a764812cda6be6c25877494R860)
 - [\#348](https://github.com/arkworks-rs/algebra/pull/348) (`ark-ec`) Rename `msm:{Fixed,Variable}BaseMSM:multi_scalar_mul` to `msm:{Fixed,Variable}:msm` to avoid redundancy.
 - [\#359](https://github.com/arkworks-rs/algebra/pull/359) (`ark-test-templates`) Simplify the field and curve test macros.
 - [\#365](https://github.com/arkworks-rs/algebra/pull/365) (`ark-ec`)
@@ -34,6 +34,7 @@
 - [\#408](https://github.com/arkworks-rs/algebra/pull/408) (`ark-ff`) Change the output of `Display` formatting for BigInt & Fp from hex to decimal.
 - [\#412](https://github.com/arkworks-rs/algebra/pull/412) (`ark-poly`) Rename UV/MVPolynomial to DenseUV/MVPolynomial.
 - [\#417](https://github.com/arkworks-rs/algebra/pull/417) (`ark-ff`) Remove `ToBytes` and `FromBytes`.
+- [\#418](https://github.com/arkworks-rs/algebra/pull/418) (`ark-ff`) Add `sums_of_products` to `Field` and `Fp`
 - [\#422](https://github.com/arkworks-rs/algebra/pull/422) (`ark-ff`) Remove `SquareRootField`, and move functionality to `Field`
 - [\#425](https://github.com/arkworks-rs/algebra/pull/425) (`ark-ec`) Refactor `VariableBase` struct to `VariableBaseMSM` trait and implement it for `GroupProjective`.
 - [\#438](https://github.com/arkworks-rs/algebra/pull/438) (`ark-ec`) Rename modules, structs, and traits related to `ec`.
@@ -46,6 +47,95 @@
     - `TEModelParameters` → `TECurveConfig`
     - `MontgomeryModelParameters` → `MontCurveConfig`
 - [\#440](https://github.com/arkworks-rs/algebra/pull/440) (`ark-ff`) Add a method to construct a field element from an element of the underlying base prime field.
+- [\#443](https://github.com/arkworks-rs/algebra/pull/443), [\#449](https://github.com/arkworks-rs/algebra/pull/449) (`ark-ec`) Improve ergonomics of scalar multiplication.
+    - Rename `ProjectiveCurve::mul(AsRef[u64])` to `ProjectiveCurve::mul_bigint(AsRef[u64])`.
+    - Bound `ProjectiveCurve` by
+        - `Mul<ScalarField>`,
+        - `for<'a> Mul<&'a ScalarField>`
+        - `MulAssign<ScalarField>`,
+        - `for<'a> MulAssign<&'a ScalarField>`
+    - Bound `AffineCurve` by
+        - `Mul<ScalarField, Output = ProjectiveCurve>`
+        - `for<'a> Mul<&'a ScalarField, Output = ProjectiveCurve>`
+- [\#445](https://github.com/arkworks-rs/algebra/pull/445) (`ark-ec`) Change the `ATE_LOOP_COUNT` in MNT4/6 curves to use 2-NAF.
+- [\#446](https://github.com/arkworks-rs/algebra/pull/446) (`ark-ff`) Add `CyclotomicMultSubgroup` trait and implement it for extension fields
+- [\#447](https://github.com/arkworks-rs/algebra/pull/447) (`ark-ec`, `ark-algebra-test-templates`) Rename and refactor group infrastructure, and test infrastructure for fields, groups, and pairings:
+    - Create new `Group` trait and move some functionality from `ProjectiveCurve` to it.
+    - Rename `ProjectiveCurve` to `CurveGroup: Group`.
+        - Rename some associated types:
+            - `AffineCurve` → `Affine`
+        - Rename some methods:
+            - `batch_normalization_into_affine` → `normalize_batch`
+    - Rename `AffineCurve` to `Affine`.
+        - Rename associated types:
+            - `Projective` → `Group`
+        - Add methods:
+            - Add method `fn x(&self) -> Self::BaseField` that returns the x coordinate of the point.
+            - Add method `fn y(&self) -> Self::BaseField` that returns the y coordinate of the point.
+        - Rename methods:
+            - `zero()` → `identity()`
+            - `is_zero()` → `is_identity()`
+            - `into_projective()` → `into_group()`
+    - Add new `ScalarMul` trait that encapsulates scalar multiplication routines for arbitrary `Group`s.
+        - `ScalarMul` trait has a `MulBase` associated type to encapsulate bases for variable base and fixed-base scalar multiplication algorithms.
+        - `ScalarMul` requires `Add<Self::MulBase, Output = Self>`, `AddAssign<Self::MulBase>`, and `From<Self::MulBase>`.
+    - Rename `PairingEngine` to `Pairing`:
+        - Rename associated types:
+            - `Fr` → `ScalarField`
+            - `G1Projective` → `G1`
+            - `G2Projective` → `G2`
+            - `Fqk` → `TargetField: CyclotomicMultSubgroup`
+        - Remove associated type `Fqe`.
+        - Rename methods:
+            - `miller_loop` → `multi_miller_loop`
+            - `pairing` → `multi_pairing`
+        - Change method signatures:
+            - `product_of_pairings` -> `multi_pairing`
+                - take two references to element iterators instead of an iterator of tuples.
+            - `miller_loop` and `multi_miller_loop` now
+                - take two iterators over `impl Into<G1Prepared>` and `impl Into<G2Prepared>` as input, and
+                - output `MillerLoopOutput`, which is a newtype wrapper around `TargetField`.
+            - `final_exponentiation` now
+                - takes as input a `MillerLoopOutput`,
+                - outputs `PairingOutput`, which is a newtype around `TargetField`, and which implements `Group` and `ScalarMul`, allowing it to be used with the existing MSM infrastructure.
+            - Pairings, which are the composition of Miller loops and final exponentiation, are changed accordingly.
+    - `ark-algebra-test-templates` macro syntax is now simplified; see the test files in `test-curves` for examples.
+- [\#463](https://github.com/arkworks-rs/algebra/pull/463) (`ark-serialize`, `ark-ff`, `ark-ec`) Refactor serialization infrastructure to enable more flexibility and less repetition of code:
+    - New `enum Compress` that indicates whether point compression should be enabled or not.
+    - New `enum Validate` that indicates whether type-specific validation checks should be carried out or not.
+    - New `trait Valid` that provides methods for checking whether a deserialized value of a given type passes appropriate validation checks. The trait has the following methods
+        - `check` which checks a single value, and
+        - `batch_check` which checks a batch of values.
+    - `CanonicalSerialize`:
+        - New signature for `serialize` that takes in an argument `compress: Compress`
+        - Old `serialize` → `serialize_compressed`
+        - `serialize_uncompressed` → `serialize_uncompressed`
+        - Every method has a default implementation that calls `serialize` with the appropriate `compress` value.
+    - `CanonicalDeserialize`:
+        - All types implementing
+        - New signature for `deserialize` that takes in arguments `compress: Compress` and `validate: Validate`.
+        - `deserialize` → `deserialize_compressed`
+        - `deserialize_uncompressed` → `deserialize_uncompressed`
+        - `deserialize_unchecked` → `deserialize_uncompressed_unchecked`
+        - New method `deserialize_compressed_unchecked` that performs decompression but skips validation checks.
+        - Every method has a default implementation that calls `deserialize` with the appropriate `compress` and `validate` values.
+    - The `SWFlags` enum has been moved to `ark_ec::models::short_weierstrass`, and has had its variants renamed to be somewhat more descriptive.
+    - The `EdwardsFlags` enum has been moved to `ark_ec::models::twisted_edwards`, has been renamed to `TEFlags`, and has had its variants renamed to be somewhat more descriptive.
+    - New serialization format for Short Weierstrass curves:
+        - Points with a "positive" y-coordinate are serialized with the sign bit set to zero (as opposed to the sign bit set to one in the old behavior).
+        - Points with a "negative" y-coordinate are serialized with the sign bit set to one (as opposed to the sign bit set to zero in the old behavior).
+        - The point at infinity is serialized with the infinity flag set to one.
+    - New serialization format for Twisted Edwards curves:
+        - Points with a "positive" x-coordinate are serialized with the sign bit set to zero.
+        - Points with a "negative" x-coordinate are serialized with the sign bit set to one.
+- [\#487](https://github.com/arkworks-rs/algebra/pull/487) (`ark-poly`) Refactor `EvaluationDomain` trait for cosets:
+    - Remove method `generator_inv`.
+    - Remove method `divide_by_vanishing_poly_on_coset_in_place`.
+    - Remove coset fft methods: `coset_fft`, `coset_fft_in_place`, `coset_ifft`, `coset_ifft_in_place`.
+- [\#492](https://github.com/arkworks-rs/algebra/pull/492) (`ark-ff`) Refactor `ark-ff` APIs:
+    - Splits the contents of `ff/src/fields/mod.rs` into smaller files for easier management.
+    - Moves `BitIterator` out of `ark_ff::fields` and into `ark_ff` directly.
+    - Adds `impl<'a, 'b> Add/Sub/Mul/Div<&'a F> for &'b F`
 
 ### Features
 
@@ -59,7 +149,17 @@
 - [\#386](https://github.com/arkworks-rs/algebra/pull/386) (`ark-ff-macros`, `ark-ff`) Add a macro to derive `MontConfig`.
 - [\#396](https://github.com/arkworks-rs/algebra/pull/396) (`ark-ec`) Add a default `mul` function to `{TE,SW}CurveConfig` trait definition.
 - [\#397](https://github.com/arkworks-rs/algebra/pull/397) (`ark-ec`) Add `HashMapPippenger` to variable-base MSM.
+- [\#418](https://github.com/arkworks-rs/algebra/pull/418) (`ark-ff`) Add `sums_of_products` to `Field` and `Fp`
 - [\#420](https://github.com/arkworks-rs/algebra/pull/420) (`ark-ec`) Add a `clear_cofactor` method to `AffineCurve`.
+- [\#430](https://github.com/arkworks-rs/algebra/pull/430) (`ark-ec`) Add functionality for mapping a field element to a curve element for hash-to-curve.
+- [\#440](https://github.com/arkworks-rs/algebra/pull/440) (`ark-ff`) Add a method to construct a field element from an element of the underlying base prime field.
+- [\#446](https://github.com/arkworks-rs/algebra/pull/446) (`ark-ff`) Add `CyclotomicMultSubgroup` trait and impl for extension fields
+- [\#467](https://github.com/arkworks-rs/algebra/pull/467) (`ark-ec`)
+    - Move implementation of `serialize_with_mode()`, `deserialize_with_mode()`, and `serialized_size()` into `{SW,TE}CurveConfig` to allow customization.
+- [\#487](https://github.com/arkworks-rs/algebra/pull/487) (`ark-poly`) Refactor `EvaluationDomain` trait for cosets:
+    - Add constructor `new_coset`.
+    - Add convenience method `get_coset`.
+    - Add methods `coset_offset`, `coset_offset_inv` and `coset_offset_pow_size`.
 
 ### Improvements
 
@@ -68,6 +168,7 @@
 - [\#339](https://github.com/arkworks-rs/algebra/pull/339) (`ark-ff`) Remove duplicated code from `test_field` module and replace its usage with `ark-test-curves` crate.
 - [\#352](https://github.com/arkworks-rs/algebra/pull/352) (`ark-ff`) Update `QuadExtField::sqrt` for better performance.
 - [\#357](https://github.com/arkworks-rs/algebra/pull/357) (`ark-poly`) Speedup division by vanishing polynomials for dense polynomials.
+- [\#445](https://github.com/arkworks-rs/algebra/pull/445) (`ark-ec`) Use 2-NAF for ate pairing in MNT4/6 curves.
 
 ### Bugfixes
 
@@ -76,6 +177,7 @@
 - [\#366](https://github.com/arkworks-rs/algebra/pull/366) (`ark-ff`) Fix `norm()` for cubic extension field towers.
 - [\#394](https://github.com/arkworks-rs/algebra/pull/394) (`ark-ff`, `ark-serialize`) Remove `EmptyFlags` construction checks.
 - [\#442](https://github.com/arkworks-rs/algebra/pull/442) (`ark-ff`) Fix deserialization for modulo with 64 shaving bits.
+- [\#460](https://github.com/arkworks-rs/algebra/pull/460) (`ark-ec`) Fix a corner case for ate pairing in BLS12 and BW6 models.
 
 ## v0.3.0
 
@@ -198,7 +300,7 @@ The main features of this release are:
 - [\#207](https://github.com/arkworks-rs/algebra/pull/207) (`ark-ff`) Improve performance of extension fields when the non-residue is negative. (Improves fq2, fq12, and g2 speed on bls12 and bn curves.)
 - [\#211](https://github.com/arkworks-rs/algebra/pull/211) (`ark-ec`) Improve performance of BLS12 final exponentiation.
 - [\#214](https://github.com/arkworks-rs/algebra/pull/214) (`ark-poly`) Utilise a more efficient way of evaluating a polynomial at a single point.
-- [\#242](https://github.com/arkworks-rs/algebra/pull/242), [\#244][https://github.com/arkworks-rs/algebra/pull/244] (`ark-poly`) Speedup the sequential radix-2 FFT significantly by making the method in which it accesses roots more cache-friendly.
+- [\#242](https://github.com/arkworks-rs/algebra/pull/242), [\#244](https://github.com/arkworks-rs/algebra/pull/244) (`ark-poly`) Speedup the sequential radix-2 FFT significantly by making the method in which it accesses roots more cache-friendly.
 
 ### Bugfixes
 

@@ -1,6 +1,6 @@
 use ark_serialize::{
     CanonicalDeserialize, CanonicalDeserializeWithFlags, CanonicalSerialize,
-    CanonicalSerializeWithFlags, EmptyFlags, Flags, SerializationError,
+    CanonicalSerializeWithFlags, Compress, EmptyFlags, Flags, SerializationError, Valid, Validate,
 };
 use ark_std::{
     cmp::{Ord, Ordering, PartialOrd},
@@ -52,75 +52,43 @@ pub trait QuadExtConfig: 'static + Send + Sync + Sized {
     /// the quadratic non-residue. This is used in Karatsuba multiplication
     /// and in complex squaring.
     #[inline(always)]
-    fn mul_base_field_by_nonresidue(fe: &Self::BaseField) -> Self::BaseField {
-        Self::NONRESIDUE * fe
+    fn mul_base_field_by_nonresidue_in_place(fe: &mut Self::BaseField) -> &mut Self::BaseField {
+        *fe *= &Self::NONRESIDUE;
+        fe
     }
 
-    /// A specializable method for computing x + mul_base_field_by_nonresidue(y)
+    /// A specializable method for setting `y = x + NONRESIDUE * y`.
     /// This allows for optimizations when the non-residue is
     /// canonically negative in the field.
     #[inline(always)]
-    fn add_and_mul_base_field_by_nonresidue(
-        x: &Self::BaseField,
-        y: &Self::BaseField,
-    ) -> Self::BaseField {
-        *x + Self::mul_base_field_by_nonresidue(y)
+    fn mul_base_field_by_nonresidue_and_add(y: &mut Self::BaseField, x: &Self::BaseField) {
+        Self::mul_base_field_by_nonresidue_in_place(y);
+        *y += x;
     }
 
     /// A specializable method for computing x + mul_base_field_by_nonresidue(y) + y
     /// This allows for optimizations when the non-residue is not -1.
     #[inline(always)]
-    fn add_and_mul_base_field_by_nonresidue_plus_one(
-        x: &Self::BaseField,
-        y: &Self::BaseField,
-    ) -> Self::BaseField {
-        let mut tmp = *x;
-        tmp += y;
-        Self::add_and_mul_base_field_by_nonresidue(&tmp, y)
+    fn mul_base_field_by_nonresidue_plus_one_and_add(y: &mut Self::BaseField, x: &Self::BaseField) {
+        let old_y = *y;
+        Self::mul_base_field_by_nonresidue_and_add(y, x);
+        *y += old_y;
     }
 
     /// A specializable method for computing x - mul_base_field_by_nonresidue(y)
     /// This allows for optimizations when the non-residue is
     /// canonically negative in the field.
     #[inline(always)]
-    fn sub_and_mul_base_field_by_nonresidue(
-        x: &Self::BaseField,
-        y: &Self::BaseField,
-    ) -> Self::BaseField {
-        *x - Self::mul_base_field_by_nonresidue(y)
+    fn sub_and_mul_base_field_by_nonresidue(y: &mut Self::BaseField, x: &Self::BaseField) {
+        Self::mul_base_field_by_nonresidue_in_place(y);
+        let mut result = *x;
+        result -= &*y;
+        *y = result;
     }
 
     /// A specializable method for multiplying an element of the base field by
     /// the appropriate Frobenius coefficient.
     fn mul_base_field_by_frob_coeff(fe: &mut Self::BaseField, power: usize);
-
-    /// A specializable method for exponentiating that is to be used
-    /// *only* when `fe` is known to be in the cyclotommic subgroup.
-    fn cyclotomic_exp(fe: &QuadExtField<Self>, exponent: impl AsRef<[u64]>) -> QuadExtField<Self> {
-        let mut res = QuadExtField::one();
-        let mut self_inverse = *fe;
-        self_inverse.conjugate();
-
-        let mut found_nonzero = false;
-        let naf = crate::biginteger::arithmetic::find_naf(exponent.as_ref());
-
-        for &value in naf.iter().rev() {
-            if found_nonzero {
-                res.square_in_place();
-            }
-
-            if value != 0 {
-                found_nonzero = true;
-
-                if value > 0 {
-                    res *= fe;
-                } else {
-                    res *= &self_inverse;
-                }
-            }
-        }
-        res
-    }
 }
 
 /// An element of a quadratic extension field F_p\[X\]/(X^2 - P::NONRESIDUE) is
@@ -163,14 +131,9 @@ impl<P: QuadExtConfig> QuadExtField<P> {
 
     /// This is only to be used when the element is *known* to be in the
     /// cyclotomic subgroup.
-    pub fn conjugate(&mut self) {
+    pub fn conjugate_in_place(&mut self) -> &mut Self {
         self.c1 = -self.c1;
-    }
-
-    /// This is only to be used when the element is *known* to be in the
-    /// cyclotomic subgroup.
-    pub fn cyclotomic_exp(&self, exponent: impl AsRef<[u64]>) -> Self {
-        P::cyclotomic_exp(self, exponent)
+        self
     }
 
     /// Norm of QuadExtField over `P::BaseField`:`Norm(a) = a * a.conjugate()`.
@@ -196,18 +159,17 @@ impl<P: QuadExtConfig> QuadExtField<P> {
     /// assert_eq!(norm, norm2.c0);
     /// ```
     pub fn norm(&self) -> P::BaseField {
-        let t0 = self.c0.square();
-        // t1 = t0 - P::NON_RESIDUE * c1^2
-        let mut t1 = self.c1.square();
-        t1 = P::sub_and_mul_base_field_by_nonresidue(&t0, &t1);
-        t1
+        // t1 = c0.square() - P::NON_RESIDUE * c1^2
+        let mut result = self.c1.square();
+        P::sub_and_mul_base_field_by_nonresidue(&mut result, &self.c0.square());
+        result
     }
 
     /// In-place multiply both coefficients `c0` & `c1` of the quadratic
     /// extension field by an element from the base field.
     pub fn mul_assign_by_basefield(&mut self, element: &P::BaseField) {
-        self.c0.mul_assign(element);
-        self.c1.mul_assign(element);
+        self.c0 *= element;
+        self.c1 *= element;
     }
 }
 
@@ -280,6 +242,12 @@ impl<P: QuadExtConfig> Field for QuadExtField<P> {
         self
     }
 
+    fn neg_in_place(&mut self) -> &mut Self {
+        self.c0.neg_in_place();
+        self.c1.neg_in_place();
+        self
+    }
+
     fn square(&self) -> Self {
         let mut result = *self;
         result.square_in_place();
@@ -311,20 +279,21 @@ impl<P: QuadExtConfig> Field for QuadExtField<P> {
         //            = (c0^2 + beta * c1^2, 2 c0 * c1)
         // Where beta is P::NONRESIDUE.
         // When beta = -1, we can re-use intermediate additions to improve performance.
-        if P::NONRESIDUE == -P::BaseField::one() {
+        if P::NONRESIDUE == -P::BaseField::ONE {
             // When the non-residue is -1, we save 2 intermediate additions,
             // and use one fewer intermediate variable
 
             let c0_copy = self.c0;
             // v0 = c0 - c1
-            let v0 = self.c0 - &self.c1;
-            // result.c1 = 2 c1
-            self.c1.double_in_place();
-            // result.c0 = (c0 - c1) + 2c1 = c0 + c1
-            self.c0 = v0 + &self.c1;
+            let mut v0 = self.c0;
+            v0 -= &self.c1;
+            self.c0 += self.c1;
             // result.c0 *= (c0 - c1)
             // result.c0 = (c0 - c1) * (c0 + c1) = c0^2 - c1^2
             self.c0 *= &v0;
+
+            // result.c1 = 2 c1
+            self.c1.double_in_place();
             // result.c1 *= c0
             // result.c1 = (2 * c1) * c0
             self.c1 *= &c0_copy;
@@ -334,7 +303,8 @@ impl<P: QuadExtConfig> Field for QuadExtField<P> {
             // v0 = c0 - c1
             let mut v0 = self.c0 - &self.c1;
             // v3 = c0 - beta * c1
-            let v3 = P::sub_and_mul_base_field_by_nonresidue(&self.c0, &self.c1);
+            let mut v3 = self.c1;
+            P::sub_and_mul_base_field_by_nonresidue(&mut v3, &self.c0);
             // v2 = c0 * c1
             let v2 = self.c0 * &self.c1;
 
@@ -344,11 +314,13 @@ impl<P: QuadExtConfig> Field for QuadExtField<P> {
             v0 *= &v3;
 
             // result.c1 = 2 * c0 * c1
-            self.c1 = v2.double();
+            self.c1 = v2;
+            self.c1.double_in_place();
             // result.c0 = (c0^2 - beta * c0 * c1 - c0 * c1 + beta * c1^2) + ((beta + 1) c0 * c1)
             // result.c0 = (c0^2 - beta * c0 * c1 + beta * c1^2) + (beta * c0 * c1)
             // result.c0 = c0^2 + beta * c1^2
-            self.c0 = P::add_and_mul_base_field_by_nonresidue_plus_one(&v0, &v2);
+            self.c0 = v2;
+            P::mul_base_field_by_nonresidue_plus_one_and_add(&mut self.c0, &v0);
 
             self
         }
@@ -362,7 +334,8 @@ impl<P: QuadExtConfig> Field for QuadExtField<P> {
             // v1 = c1.square()
             let v1 = self.c1.square();
             // v0 = c0.square() - beta * v1
-            let v0 = P::sub_and_mul_base_field_by_nonresidue(&self.c0.square(), &v1);
+            let mut v0 = v1;
+            P::sub_and_mul_base_field_by_nonresidue(&mut v0, &self.c0.square());
 
             v0.inverse().map(|v1| {
                 let c0 = self.c0 * &v1;
@@ -598,8 +571,8 @@ impl<P: QuadExtConfig> Neg for QuadExtField<P> {
     #[inline]
     #[must_use]
     fn neg(mut self) -> Self {
-        self.c0 = -self.c0;
-        self.c1 = -self.c1;
+        self.c0.neg_in_place();
+        self.c1.neg_in_place();
         self
     }
 }
@@ -616,7 +589,7 @@ impl<'a, P: QuadExtConfig> Add<&'a QuadExtField<P>> for QuadExtField<P> {
 
     #[inline]
     fn add(mut self, other: &Self) -> Self {
-        self.add_assign(other);
+        self += other;
         self
     }
 }
@@ -624,9 +597,9 @@ impl<'a, P: QuadExtConfig> Add<&'a QuadExtField<P>> for QuadExtField<P> {
 impl<'a, P: QuadExtConfig> Sub<&'a QuadExtField<P>> for QuadExtField<P> {
     type Output = Self;
 
-    #[inline]
+    #[inline(always)]
     fn sub(mut self, other: &Self) -> Self {
-        self.sub_assign(other);
+        self -= other;
         self
     }
 }
@@ -634,9 +607,9 @@ impl<'a, P: QuadExtConfig> Sub<&'a QuadExtField<P>> for QuadExtField<P> {
 impl<'a, P: QuadExtConfig> Mul<&'a QuadExtField<P>> for QuadExtField<P> {
     type Output = Self;
 
-    #[inline]
+    #[inline(always)]
     fn mul(mut self, other: &Self) -> Self {
-        self.mul_assign(other);
+        self *= other;
         self
     }
 }
@@ -673,16 +646,28 @@ impl_multiplicative_ops_from_ref!(QuadExtField, QuadExtConfig);
 impl<'a, P: QuadExtConfig> MulAssign<&'a Self> for QuadExtField<P> {
     #[inline]
     fn mul_assign(&mut self, other: &Self) {
-        // Karatsuba multiplication;
-        // Guide to Pairing-based cryprography, Algorithm 5.16.
-        let v0 = self.c0 * &other.c0;
-        let v1 = self.c1 * &other.c1;
+        if Self::extension_degree() == 2 {
+            let c1_input = [self.c0, self.c1];
+            P::mul_base_field_by_nonresidue_in_place(&mut self.c1);
+            *self = Self::new(
+                P::BaseField::sum_of_products(&[self.c0, self.c1], &[other.c0, other.c1]),
+                P::BaseField::sum_of_products(&c1_input, &[other.c1, other.c0]),
+            )
+        } else {
+            // Karatsuba multiplication;
+            // Guide to Pairing-based cryprography, Algorithm 5.16.
+            let mut v0 = self.c0;
+            v0 *= &other.c0;
+            let mut v1 = self.c1;
+            v1 *= &other.c1;
 
-        self.c1 += &self.c0;
-        self.c1 *= &(other.c0 + &other.c1);
-        self.c1 -= &v0;
-        self.c1 -= &v1;
-        self.c0 = P::add_and_mul_base_field_by_nonresidue(&v0, &v1);
+            self.c1 += &self.c0;
+            self.c1 *= &(other.c0 + &other.c1);
+            self.c1 -= &v0;
+            self.c1 -= &v1;
+            self.c0 = v1;
+            P::mul_base_field_by_nonresidue_and_add(&mut self.c0, &v0);
+        }
     }
 }
 
@@ -706,25 +691,29 @@ impl<P: QuadExtConfig> CanonicalSerializeWithFlags for QuadExtField<P> {
         mut writer: W,
         flags: F,
     ) -> Result<(), SerializationError> {
-        self.c0.serialize(&mut writer)?;
+        self.c0.serialize_compressed(&mut writer)?;
         self.c1.serialize_with_flags(&mut writer, flags)?;
         Ok(())
     }
 
     #[inline]
     fn serialized_size_with_flags<F: Flags>(&self) -> usize {
-        self.c0.serialized_size() + self.c1.serialized_size_with_flags::<F>()
+        self.c0.compressed_size() + self.c1.serialized_size_with_flags::<F>()
     }
 }
 
 impl<P: QuadExtConfig> CanonicalSerialize for QuadExtField<P> {
     #[inline]
-    fn serialize<W: Write>(&self, writer: W) -> Result<(), SerializationError> {
+    fn serialize_with_mode<W: Write>(
+        &self,
+        writer: W,
+        _compress: Compress,
+    ) -> Result<(), SerializationError> {
         self.serialize_with_flags(writer, EmptyFlags)
     }
 
     #[inline]
-    fn serialized_size(&self) -> usize {
+    fn serialized_size(&self, _compress: Compress) -> usize {
         self.serialized_size_with_flags::<EmptyFlags>()
     }
 }
@@ -734,18 +723,30 @@ impl<P: QuadExtConfig> CanonicalDeserializeWithFlags for QuadExtField<P> {
     fn deserialize_with_flags<R: Read, F: Flags>(
         mut reader: R,
     ) -> Result<(Self, F), SerializationError> {
-        let c0: P::BaseField = CanonicalDeserialize::deserialize(&mut reader)?;
-        let (c1, flags): (P::BaseField, _) =
-            CanonicalDeserializeWithFlags::deserialize_with_flags(&mut reader)?;
+        let c0 = CanonicalDeserialize::deserialize_compressed(&mut reader)?;
+        let (c1, flags) = CanonicalDeserializeWithFlags::deserialize_with_flags(&mut reader)?;
         Ok((QuadExtField::new(c0, c1), flags))
+    }
+}
+
+impl<P: QuadExtConfig> Valid for QuadExtField<P> {
+    fn check(&self) -> Result<(), SerializationError> {
+        self.c0.check()?;
+        self.c1.check()
     }
 }
 
 impl<P: QuadExtConfig> CanonicalDeserialize for QuadExtField<P> {
     #[inline]
-    fn deserialize<R: Read>(mut reader: R) -> Result<Self, SerializationError> {
-        let c0: P::BaseField = CanonicalDeserialize::deserialize(&mut reader)?;
-        let c1: P::BaseField = CanonicalDeserialize::deserialize(&mut reader)?;
+    fn deserialize_with_mode<R: Read>(
+        mut reader: R,
+        compress: Compress,
+        validate: Validate,
+    ) -> Result<Self, SerializationError> {
+        let c0: P::BaseField =
+            CanonicalDeserialize::deserialize_with_mode(&mut reader, compress, validate)?;
+        let c1: P::BaseField =
+            CanonicalDeserialize::deserialize_with_mode(&mut reader, compress, validate)?;
         Ok(QuadExtField::new(c0, c1))
     }
 }

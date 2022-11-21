@@ -1,10 +1,12 @@
 use crate::{
-    const_for,
-    fields::{BitIteratorBE, BitIteratorLE},
-    UniformRand,
+    bits::{BitIteratorBE, BitIteratorLE},
+    const_for, UniformRand,
 };
+#[allow(unused)]
 use ark_ff_macros::unroll_for_loops;
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, SerializationError};
+use ark_serialize::{
+    CanonicalDeserialize, CanonicalSerialize, Compress, SerializationError, Valid, Validate,
+};
 use ark_std::{
     convert::TryFrom,
     fmt::{Debug, Display, UpperHex},
@@ -30,13 +32,35 @@ impl<const N: usize> Default for BigInt<N> {
     }
 }
 
-impl<const N: usize> BigInt<N> {
-    pub const fn new(value: [u64; N]) -> Self {
-        Self(value)
+impl<const N: usize> CanonicalSerialize for BigInt<N> {
+    fn serialize_with_mode<W: Write>(
+        &self,
+        writer: W,
+        compress: Compress,
+    ) -> Result<(), SerializationError> {
+        self.0.serialize_with_mode(writer, compress)
     }
 
-    pub const fn zero() -> Self {
-        Self([0u64; N])
+    fn serialized_size(&self, compress: Compress) -> usize {
+        self.0.serialized_size(compress)
+    }
+}
+
+impl<const N: usize> Valid for BigInt<N> {
+    fn check(&self) -> Result<(), SerializationError> {
+        self.0.check()
+    }
+}
+
+impl<const N: usize> CanonicalDeserialize for BigInt<N> {
+    fn deserialize_with_mode<R: Read>(
+        reader: R,
+        compress: Compress,
+        validate: Validate,
+    ) -> Result<Self, SerializationError> {
+        Ok(BigInt::<N>(<[u64; N]>::deserialize_with_mode(
+            reader, compress, validate,
+        )?))
     }
 }
 
@@ -96,6 +120,20 @@ macro_rules! const_modulo {
 }
 
 impl<const N: usize> BigInt<N> {
+    pub const fn new(value: [u64; N]) -> Self {
+        Self(value)
+    }
+
+    pub const fn zero() -> Self {
+        Self([0u64; N])
+    }
+
+    pub const fn one() -> Self {
+        let mut one = Self::zero();
+        one.0[0] = 1;
+        one
+    }
+
     #[doc(hidden)]
     pub const fn const_is_even(&self) -> bool {
         self.0[0] % 2 == 0
@@ -104,6 +142,13 @@ impl<const N: usize> BigInt<N> {
     #[doc(hidden)]
     pub const fn const_is_odd(&self) -> bool {
         self.0[0] % 2 == 1
+    }
+
+    #[doc(hidden)]
+    pub const fn mod_4(&self) -> u8 {
+        // To compute n % 4, we need to simply look at the
+        // 2 least significant bits of n, and check their value mod 4.
+        (((self.0[0] << 62) >> 62) % 4) as u8
     }
 
     /// Compute a right shift of `self`
@@ -183,7 +228,6 @@ impl<const N: usize> BigInt<N> {
     }
 
     #[inline]
-    #[unroll_for_loops(12)]
     pub(crate) const fn const_sub_with_borrow(mut self, other: &Self) -> (Self, bool) {
         let mut borrow = 0;
 
@@ -192,6 +236,17 @@ impl<const N: usize> BigInt<N> {
         });
 
         (self, borrow != 0)
+    }
+
+    #[inline]
+    pub(crate) const fn const_add_with_carry(mut self, other: &Self) -> (Self, bool) {
+        let mut carry = 0;
+
+        crate::const_for!((i in 0..N) {
+            self.0[i] = adc!(self.0[i], other.0[i], &mut carry);
+        });
+
+        (self, carry != 0)
     }
 
     const fn const_mul2(mut self) -> Self {
@@ -206,7 +261,6 @@ impl<const N: usize> BigInt<N> {
         self
     }
 
-    #[unroll_for_loops(12)]
     pub(crate) const fn const_is_zero(&self) -> bool {
         let mut is_zero = true;
         crate::const_for!((i in 0..N) {
@@ -235,51 +289,72 @@ impl<const N: usize> BigInteger for BigInt<N> {
     const NUM_LIMBS: usize = N;
 
     #[inline]
-    #[unroll_for_loops(12)]
     fn add_with_carry(&mut self, other: &Self) -> bool {
-        let mut carry = 0;
+        {
+            use arithmetic::adc_for_add_with_carry as adc;
 
-        for i in 0..N {
-            #[cfg(all(target_arch = "x86_64", feature = "asm"))]
-            #[allow(unsafe_code)]
-            unsafe {
-                use core::arch::x86_64::_addcarry_u64;
-                carry = _addcarry_u64(carry, self.0[i], other.0[i], &mut self.0[i])
-            };
+            let a = &mut self.0;
+            let b = &other.0;
+            let mut carry = 0;
 
-            #[cfg(not(all(target_arch = "x86_64", feature = "asm")))]
-            {
-                self.0[i] = arithmetic::adc(self.0[i], other.0[i], &mut carry);
+            if N >= 1 {
+                carry = adc(&mut a[0], b[0], carry);
             }
+            if N >= 2 {
+                carry = adc(&mut a[1], b[1], carry);
+            }
+            if N >= 3 {
+                carry = adc(&mut a[2], b[2], carry);
+            }
+            if N >= 4 {
+                carry = adc(&mut a[3], b[3], carry);
+            }
+            if N >= 5 {
+                carry = adc(&mut a[4], b[4], carry);
+            }
+            if N >= 6 {
+                carry = adc(&mut a[5], b[5], carry);
+            }
+            for i in 6..N {
+                carry = adc(&mut a[i], b[i], carry);
+            }
+            carry != 0
         }
-
-        carry != 0
     }
 
     #[inline]
-    #[unroll_for_loops(12)]
     fn sub_with_borrow(&mut self, other: &Self) -> bool {
-        let mut borrow = 0;
+        use arithmetic::sbb_for_sub_with_borrow as sbb;
 
-        for i in 0..N {
-            #[cfg(all(target_arch = "x86_64", feature = "asm"))]
-            #[allow(unsafe_code)]
-            unsafe {
-                use core::arch::x86_64::_subborrow_u64;
-                borrow = _subborrow_u64(borrow, self.0[i], other.0[i], &mut self.0[i])
-            };
+        let a = &mut self.0;
+        let b = &other.0;
+        let mut borrow = 0u8;
 
-            #[cfg(not(all(target_arch = "x86_64", feature = "asm")))]
-            {
-                self.0[i] = arithmetic::sbb(self.0[i], other.0[i], &mut borrow);
-            }
+        if N >= 1 {
+            borrow = sbb(&mut a[0], b[0], borrow);
         }
-
+        if N >= 2 {
+            borrow = sbb(&mut a[1], b[1], borrow);
+        }
+        if N >= 3 {
+            borrow = sbb(&mut a[2], b[2], borrow);
+        }
+        if N >= 4 {
+            borrow = sbb(&mut a[3], b[3], borrow);
+        }
+        if N >= 5 {
+            borrow = sbb(&mut a[4], b[4], borrow);
+        }
+        if N >= 6 {
+            borrow = sbb(&mut a[5], b[5], borrow);
+        }
+        for i in 6..N {
+            borrow = sbb(&mut a[i], b[i], borrow);
+        }
         borrow != 0
     }
 
     #[inline]
-    #[unroll_for_loops(12)]
     #[allow(unused)]
     fn mul2(&mut self) {
         #[cfg(all(target_arch = "x86_64", feature = "asm"))]
@@ -309,7 +384,6 @@ impl<const N: usize> BigInteger for BigInt<N> {
     }
 
     #[inline]
-    #[unroll_for_loops(12)]
     fn muln(&mut self, mut n: u32) {
         if n >= (64 * N) as u32 {
             *self = Self::from(0u64);
@@ -338,8 +412,6 @@ impl<const N: usize> BigInteger for BigInt<N> {
     }
 
     #[inline]
-    #[unroll_for_loops(12)]
-    #[allow(unused)]
     fn div2(&mut self) {
         let mut t = 0;
         for i in 0..N {
@@ -352,7 +424,6 @@ impl<const N: usize> BigInteger for BigInt<N> {
     }
 
     #[inline]
-    #[unroll_for_loops(12)]
     fn divn(&mut self, mut n: u32) {
         if n >= (64 * N) as u32 {
             *self = Self::from(0u64);
@@ -392,12 +463,7 @@ impl<const N: usize> BigInteger for BigInt<N> {
 
     #[inline]
     fn is_zero(&self) -> bool {
-        for i in 0..N {
-            if self.0[i] != 0 {
-                return false;
-            }
-        }
-        true
+        self.0.iter().all(|&e| e == 0)
     }
 
     #[inline]
@@ -444,17 +510,11 @@ impl<const N: usize> BigInteger for BigInt<N> {
     }
 
     fn from_bits_le(bits: &[bool]) -> Self {
-        let mut res = Self::default();
-        let mut acc: u64 = 0;
-
-        let bits = bits.to_vec();
-        for (i, bits64) in bits.chunks(64).enumerate() {
-            for bit in bits64.iter().rev() {
-                acc <<= 1;
-                acc += *bit as u64;
+        let mut res = Self::zero();
+        for (bits64, res_i) in bits.chunks(64).zip(&mut res.0) {
+            for (i, bit) in bits64.iter().enumerate() {
+                *res_i |= (*bit as u64) << i;
             }
-            res.0[i] = acc;
-            acc = 0;
         }
         res
     }
@@ -469,7 +529,7 @@ impl<const N: usize> BigInteger for BigInt<N> {
     #[inline]
     fn to_bytes_le(&self) -> Vec<u8> {
         let array_map = self.0.iter().map(|limb| limb.to_le_bytes());
-        let mut res = Vec::<u8>::with_capacity(N * 8);
+        let mut res = Vec::with_capacity(N * 8);
         for limb in array_map {
             res.extend_from_slice(&limb);
         }
@@ -477,51 +537,24 @@ impl<const N: usize> BigInteger for BigInt<N> {
     }
 }
 
-impl<const N: usize> CanonicalSerialize for BigInt<N> {
-    #[inline]
-    fn serialize<W: Write>(&self, mut writer: W) -> Result<(), SerializationError> {
-        for num in self.0 {
-            writer.write_all(&num.to_le_bytes())?;
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn serialized_size(&self) -> usize {
-        Self::NUM_LIMBS * 8
-    }
-}
-
-impl<const N: usize> CanonicalDeserialize for BigInt<N> {
-    #[inline]
-    fn deserialize<R: Read>(mut reader: R) -> Result<Self, SerializationError> {
-        let mut res = [0u64; N];
-        for num in res.iter_mut() {
-            let mut bytes = [0u8; 8];
-            reader.read_exact(&mut bytes)?;
-            *num = u64::from_le_bytes(bytes);
-        }
-        Ok(Self::new(res))
-    }
-}
-
 impl<const N: usize> UpperHex for BigInt<N> {
-    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{:016X}", BigUint::from(*self))
     }
 }
 
 impl<const N: usize> Display for BigInt<N> {
-    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", BigUint::from(*self))
     }
 }
 
 impl<const N: usize> Ord for BigInt<N> {
     #[inline]
-    #[unroll_for_loops(12)]
-    fn cmp(&self, other: &Self) -> ::core::cmp::Ordering {
+    #[cfg_attr(target_arch = "x86_64", unroll_for_loops(12))]
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         use core::cmp::Ordering;
+        #[cfg(target_arch = "x86_64")]
         for i in 0..N {
             let a = &self.0[N - i - 1];
             let b = &other.0[N - i - 1];
@@ -530,13 +563,21 @@ impl<const N: usize> Ord for BigInt<N> {
                 order => return order,
             };
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        for (a, b) in self.0.iter().rev().zip(other.0.iter().rev()) {
+            if a < b {
+                return Ordering::Less;
+            } else if a > b {
+                return Ordering::Greater;
+            }
+        }
         Ordering::Equal
     }
 }
 
 impl<const N: usize> PartialOrd for BigInt<N> {
     #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<::core::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
@@ -756,7 +797,7 @@ pub trait BigInteger:
     /// zero.mul2();
     /// assert_eq!(zero, B::from(0u64));
     ///
-    /// let mut arr : [bool; 64] = [false; 64];
+    /// let mut arr: [bool; 64] = [false; 64];
     /// arr[0] = true;
     /// let mut mul = B::from_bits_be(&arr);
     /// mul.mul2();
@@ -781,7 +822,7 @@ pub trait BigInteger:
     /// zero.muln(5);
     /// assert_eq!(zero, B::from(0u64));
     ///
-    /// let mut arr : [bool; 64] = [false; 64];
+    /// let mut arr: [bool; 64] = [false; 64];
     /// arr[4] = true;
     /// let mut mul = B::from_bits_be(&arr);
     /// mul.muln(5);
@@ -824,7 +865,7 @@ pub trait BigInteger:
     /// assert_eq!(one, thirty_two_div);
     ///
     /// // Edge-Case
-    /// let mut arr : [bool; 64] = [false; 64];
+    /// let mut arr: [bool; 64] = [false; 64];
     /// arr[4] = true;
     /// let mut div = B::from_bits_le(&arr);
     /// div.divn(5);
@@ -900,7 +941,7 @@ pub trait BigInteger:
     /// ```
     /// use ark_ff::{biginteger::BigInteger64 as B, BigInteger as _};
     ///
-    /// let mut arr : [bool; 64] = [false; 64];
+    /// let mut arr: [bool; 64] = [false; 64];
     /// arr[63] = true;
     /// let mut one = B::from(1u64);
     /// assert_eq!(B::from_bits_be(&arr), one);
@@ -914,7 +955,7 @@ pub trait BigInteger:
     /// ```
     /// use ark_ff::{biginteger::BigInteger64 as B, BigInteger as _};
     ///
-    /// let mut arr : [bool; 64] = [false; 64];
+    /// let mut arr: [bool; 64] = [false; 64];
     /// arr[0] = true;
     /// let mut one = B::from(1u64);
     /// assert_eq!(B::from_bits_le(&arr), one);

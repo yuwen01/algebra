@@ -1,7 +1,15 @@
-use super::quadratic_extension::*;
-use core::{marker::PhantomData, ops::MulAssign};
+use ark_std::Zero;
 
-use crate::fields::{Fp3, Fp3Config};
+use super::quadratic_extension::*;
+use core::{
+    marker::PhantomData,
+    ops::{MulAssign, Not},
+};
+
+use crate::{
+    fields::{Fp3, Fp3Config},
+    CyclotomicMultSubgroup,
+};
 
 pub trait Fp6Config: 'static + Send + Sync {
     type Fp3Config: Fp3Config;
@@ -12,13 +20,13 @@ pub trait Fp6Config: 'static + Send + Sync {
     const FROBENIUS_COEFF_FP6_C1: &'static [<Self::Fp3Config as Fp3Config>::Fp];
 
     #[inline(always)]
-    fn mul_fp3_by_nonresidue(fe: &Fp3<Self::Fp3Config>) -> Fp3<Self::Fp3Config> {
-        let mut res = *fe;
-        res.c0 = fe.c2;
-        res.c1 = fe.c0;
-        res.c2 = fe.c1;
-        res.c0 = <Self::Fp3Config as Fp3Config>::mul_fp_by_nonresidue(&res.c0);
-        res
+    fn mul_fp3_by_nonresidue_in_place(fe: &mut Fp3<Self::Fp3Config>) -> &mut Fp3<Self::Fp3Config> {
+        let old_c1 = fe.c1;
+        fe.c1 = fe.c0;
+        fe.c0 = fe.c2;
+        <Self::Fp3Config as Fp3Config>::mul_fp_by_nonresidue_in_place(&mut fe.c0);
+        fe.c2 = old_c1;
+        fe
     }
 }
 
@@ -36,8 +44,9 @@ impl<P: Fp6Config> QuadExtConfig for Fp6ConfigWrapper<P> {
     const FROBENIUS_COEFF_C1: &'static [Self::FrobCoeff] = P::FROBENIUS_COEFF_FP6_C1;
 
     #[inline(always)]
-    fn mul_base_field_by_nonresidue(fe: &Self::BaseField) -> Self::BaseField {
-        P::mul_fp3_by_nonresidue(fe)
+    fn mul_base_field_by_nonresidue_in_place(fe: &mut Self::BaseField) -> &mut Self::BaseField {
+        P::mul_fp3_by_nonresidue_in_place(fe);
+        fe
     }
 
     fn mul_base_field_by_frob_coeff(fe: &mut Self::BaseField, power: usize) {
@@ -106,5 +115,15 @@ impl<P: Fp6Config> Fp6<P> {
         self.c1.c0 = x0 * &z3 + &(tmp1 * &z5) + &(tmp2 * &z2);
         self.c1.c1 = x0 * &z4 + &(x1 * &z3) + &(x4 * &z0);
         self.c1.c2 = x0 * &z5 + &(x1 * &z4) + &(x4 * &z1);
+    }
+}
+
+impl<P: Fp6Config> CyclotomicMultSubgroup for Fp6<P> {
+    const INVERSE_IS_FAST: bool = true;
+    fn cyclotomic_inverse_in_place(&mut self) -> Option<&mut Self> {
+        self.is_zero().not().then(|| {
+            self.conjugate_in_place();
+            self
+        })
     }
 }

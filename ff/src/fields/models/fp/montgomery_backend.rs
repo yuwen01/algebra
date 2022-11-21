@@ -23,21 +23,30 @@ pub trait MontConfig<const N: usize>: 'static + Sync + Send + Sized {
     const R2: BigInt<N> = Self::MODULUS.montgomery_r2();
 
     /// INV = -MODULUS^{-1} mod 2^64
-    const INV: u64 = inv(&Self::MODULUS);
+    const INV: u64 = inv::<Self, N>();
 
     /// A multiplicative generator of the field.
     /// `Self::GENERATOR` is an element having multiplicative order
     /// `Self::MODULUS - 1`.
     const GENERATOR: Fp<MontBackend<Self, N>, N>;
 
-    /// Can we use the no-carry optimization for multiplication and squaring
-    /// outlined [here](https://hackmd.io/@zkteam/modular_multiplication)?
+    /// Can we use the no-carry optimization for multiplication
+    /// outlined [here](https://hackmd.io/@gnark/modular_multiplication)?
     ///
     /// This optimization applies if
-    /// `Self::MODULUS` has (a) a non-zero MSB, and (b) at least one
-    /// zero bit in the rest of the modulus.
+    /// (a) `Self::MODULUS[N-1] < u64::MAX >> 1`, and
+    /// (b) the bits of the modulus are not all 1.
     #[doc(hidden)]
-    const CAN_USE_NO_CARRY_OPT: bool = can_use_no_carry_optimization(&Self::MODULUS);
+    const CAN_USE_NO_CARRY_MUL_OPT: bool = can_use_no_carry_mul_optimization::<Self, N>();
+
+    /// Can we use the no-carry optimization for squaring
+    /// outlined [here](https://hackmd.io/@gnark/modular_multiplication)?
+    ///
+    /// This optimization applies if
+    /// (a) `Self::MODULUS[N-1] < u64::MAX >> 2`, and
+    /// (b) the bits of the modulus are not all 1.
+    #[doc(hidden)]
+    const CAN_USE_NO_CARRY_SQUARE_OPT: bool = can_use_no_carry_mul_optimization::<Self, N>();
 
     /// 2^s root of unity computed by GENERATOR^t
     const TWO_ADIC_ROOT_OF_UNITY: Fp<MontBackend<Self, N>, N>;
@@ -58,13 +67,27 @@ pub trait MontConfig<const N: usize>: 'static + Sync + Send + Sized {
     /// Precomputed material for use when computing square roots.
     /// The default is to use the standard Tonelli-Shanks algorithm.
     const SQRT_PRECOMP: Option<SqrtPrecomputation<Fp<MontBackend<Self, N>, N>>> =
-        Some(SqrtPrecomputation::TonelliShanks(
-            <MontBackend<Self, N>>::TWO_ADICITY,
-            &<Fp<MontBackend<Self, N>, N>>::TRACE_MINUS_ONE_DIV_TWO,
-            Self::TWO_ADIC_ROOT_OF_UNITY,
-        ));
+        sqrt_precomputation::<N, Self>();
 
-    /// Set a += b;
+    /// (MODULUS + 1) / 4 when MODULUS % 4 == 3. Used for square root precomputations.
+    #[doc(hidden)]
+    const MODULUS_PLUS_ONE_DIV_FOUR: Option<BigInt<N>> = {
+        match Self::MODULUS.mod_4() == 3 {
+            true => {
+                let (modulus_plus_one, carry) =
+                    Self::MODULUS.const_add_with_carry(&BigInt::<N>::one());
+                let mut result = modulus_plus_one.divide_by_2_round_down();
+                // Since modulus_plus_one is even, dividing by 2 results in a MSB of 0.
+                // Thus we can set MSB to `carry` to get the correct result of (MODULUS + 1) // 2:
+                result.0[N - 1] |= (carry as u64) << 63;
+                Some(result.divide_by_2_round_down())
+            },
+            false => None,
+        }
+    };
+
+    /// Sets `a = a + b`.
+    #[inline(always)]
     fn add_assign(a: &mut Fp<MontBackend<Self, N>, N>, b: &Fp<MontBackend<Self, N>, N>) {
         // This cannot exceed the backing capacity.
         a.0.add_with_carry(&b.0);
@@ -72,6 +95,8 @@ pub trait MontConfig<const N: usize>: 'static + Sync + Send + Sized {
         a.subtract_modulus();
     }
 
+    /// Sets `a = a - b`.
+    #[inline(always)]
     fn sub_assign(a: &mut Fp<MontBackend<Self, N>, N>, b: &Fp<MontBackend<Self, N>, N>) {
         // If `other` is larger than `self`, add the modulus to self first.
         if b.0 > a.0 {
@@ -80,6 +105,8 @@ pub trait MontConfig<const N: usize>: 'static + Sync + Send + Sized {
         a.0.sub_with_borrow(&b.0);
     }
 
+    /// Sets `a = 2 * a`.
+    #[inline(always)]
     fn double_in_place(a: &mut Fp<MontBackend<Self, N>, N>) {
         // This cannot exceed the backing capacity.
         a.0.mul2();
@@ -87,31 +114,48 @@ pub trait MontConfig<const N: usize>: 'static + Sync + Send + Sized {
         a.subtract_modulus();
     }
 
+    /// Sets `a = -a`.
+    #[inline(always)]
+    fn neg_in_place(a: &mut Fp<MontBackend<Self, N>, N>) {
+        if !a.is_zero() {
+            let mut tmp = Self::MODULUS;
+            tmp.sub_with_borrow(&a.0);
+            a.0 = tmp;
+        }
+    }
+
     /// This modular multiplication algorithm uses Montgomery
     /// reduction for efficient implementation. It also additionally
     /// uses the "no-carry optimization" outlined
-    /// [here](https://hackmd.io/@zkteam/modular_multiplication) if
+    /// [here](https://hackmd.io/@gnark/modular_multiplication) if
     /// `Self::MODULUS` has (a) a non-zero MSB, and (b) at least one
     /// zero bit in the rest of the modulus.
-    #[inline]
     #[unroll_for_loops(12)]
+    #[inline(always)]
     fn mul_assign(a: &mut Fp<MontBackend<Self, N>, N>, b: &Fp<MontBackend<Self, N>, N>) {
         // No-carry optimisation applied to CIOS
-        if Self::CAN_USE_NO_CARRY_OPT {
+        if Self::CAN_USE_NO_CARRY_MUL_OPT {
             if N <= 6
                 && N > 1
                 && cfg!(all(
                     feature = "asm",
-                    inline_asm_stable,
                     target_feature = "bmi2",
                     target_feature = "adx",
                     target_arch = "x86_64"
                 ))
             {
-                #[cfg(all(feature = "asm", inline_asm_stable, target_feature = "bmi2", target_feature = "adx", target_arch = "x86_64"))]
+                #[cfg(
+                    all(
+                        feature = "asm", 
+                        target_feature = "bmi2", 
+                        target_feature = "adx", 
+                        target_arch = "x86_64"
+                    )
+                )]
                 #[allow(unsafe_code, unused_mut)]
-                // Tentatively avoid using assembly for `N == 1`.
                 #[rustfmt::skip]
+
+                // Tentatively avoid using assembly for `N == 1`.
                 match N {
                     2 => { ark_ff_asm::x86_64_asm_mul!(2, (a.0).0, (b.0).0); },
                     3 => { ark_ff_asm::x86_64_asm_mul!(3, (a.0).0, (b.0).0); },
@@ -122,13 +166,16 @@ pub trait MontConfig<const N: usize>: 'static + Sync + Send + Sized {
                 };
             } else {
                 let mut r = [0u64; N];
-                let mut carry1 = 0u64;
-                let mut carry2 = 0u64;
 
                 for i in 0..N {
+                    let mut carry1 = 0u64;
                     r[0] = fa::mac(r[0], (a.0).0[0], (b.0).0[i], &mut carry1);
+
                     let k = r[0].wrapping_mul(Self::INV);
+
+                    let mut carry2 = 0u64;
                     fa::mac_discard(r[0], k, Self::MODULUS.0[0], &mut carry2);
+
                     for j in 1..N {
                         r[j] = fa::mac_with_carry(r[j], (a.0).0[j], (b.0).0[i], &mut carry1);
                         r[j - 1] = fa::mac_with_carry(r[j], k, Self::MODULUS.0[j], &mut carry2);
@@ -139,12 +186,13 @@ pub trait MontConfig<const N: usize>: 'static + Sync + Send + Sized {
             }
         } else {
             // Alternative implementation
-            *a = a.mul_without_reduce(b);
+            // Implements CIOS.
+            *a = a.mul_without_cond_subtract(b);
         }
         a.subtract_modulus();
     }
 
-    #[inline]
+    #[inline(always)]
     #[unroll_for_loops(12)]
     fn square_in_place(a: &mut Fp<MontBackend<Self, N>, N>) {
         if N == 1 {
@@ -154,30 +202,35 @@ pub trait MontConfig<const N: usize>: 'static + Sync + Send + Sized {
             Self::mul_assign(a, &temp);
             return;
         }
-        #[cfg(all(
-            feature = "asm",
-            inline_asm_stable,
-            target_feature = "bmi2",
-            target_feature = "adx",
-            target_arch = "x86_64"
-        ))]
-        #[allow(unsafe_code, unused_mut)]
+        if Self::CAN_USE_NO_CARRY_SQUARE_OPT
+            && (2..=6).contains(&N)
+            && cfg!(all(
+                feature = "asm",
+                target_feature = "bmi2",
+                target_feature = "adx",
+                target_arch = "x86_64"
+            ))
         {
-            // Checking the modulus at compile time
-            if N <= 6 && Self::CAN_USE_NO_CARRY_OPT {
-                #[rustfmt::skip]
-                match N {
-                    2 => { ark_ff_asm::x86_64_asm_square!(2, (a.0).0); },
-                    3 => { ark_ff_asm::x86_64_asm_square!(3, (a.0).0); },
-                    4 => { ark_ff_asm::x86_64_asm_square!(4, (a.0).0); },
-                    5 => { ark_ff_asm::x86_64_asm_square!(5, (a.0).0); },
-                    6 => { ark_ff_asm::x86_64_asm_square!(6, (a.0).0); },
-                    _ => unsafe { ark_std::hint::unreachable_unchecked() },
-                };
-                a.subtract_modulus();
-                return;
-            }
+            #[cfg(all(
+                feature = "asm",
+                target_feature = "bmi2",
+                target_feature = "adx",
+                target_arch = "x86_64"
+            ))]
+            #[allow(unsafe_code, unused_mut)]
+            #[rustfmt::skip]
+            match N {
+                2 => { ark_ff_asm::x86_64_asm_square!(2, (a.0).0); },
+                3 => { ark_ff_asm::x86_64_asm_square!(3, (a.0).0); },
+                4 => { ark_ff_asm::x86_64_asm_square!(4, (a.0).0); },
+                5 => { ark_ff_asm::x86_64_asm_square!(5, (a.0).0); },
+                6 => { ark_ff_asm::x86_64_asm_square!(6, (a.0).0); },
+                _ => unsafe { ark_std::hint::unreachable_unchecked() },
+            };
+            a.subtract_modulus();
+            return;
         }
+
         let mut r = crate::const_helpers::MulBuffer::<N>::zeroed();
 
         let mut carry = 0;
@@ -199,19 +252,18 @@ pub trait MontConfig<const N: usize>: 'static + Sync + Send + Sized {
 
         for i in 0..N {
             r[2 * i] = fa::mac_with_carry(r[2 * i], (a.0).0[i], (a.0).0[i], &mut carry);
-            r[2 * i + 1] = fa::adc(r[2 * i + 1], 0, &mut carry);
+            carry = fa::adc(&mut r[2 * i + 1], 0, carry);
         }
         // Montgomery reduction
         let mut carry2 = 0;
         for i in 0..N {
             let k = r[i].wrapping_mul(Self::INV);
             let mut carry = 0;
-            fa::mac_with_carry(r[i], k, Self::MODULUS.0[0], &mut carry);
+            fa::mac_discard(r[i], k, Self::MODULUS.0[0], &mut carry);
             for j in 1..N {
                 r[j + i] = fa::mac_with_carry(r[j + i], k, Self::MODULUS.0[j], &mut carry);
             }
-            r.b1[i] = fa::adc(r.b1[i], carry2, &mut carry);
-            carry2 = carry;
+            carry2 = fa::adc(&mut r.b1[i], carry, carry2);
         }
         (a.0).0.copy_from_slice(&r.b1);
         a.subtract_modulus();
@@ -277,11 +329,11 @@ pub trait MontConfig<const N: usize>: 'static + Sync + Send + Sized {
         let mut r = Fp::new_unchecked(r);
         if r.is_zero() {
             Some(r)
-        } else if r.is_less_than_modulus() {
+        } else if r.is_geq_modulus() {
+            None
+        } else {
             r *= &Fp::new_unchecked(Self::R2);
             Some(r)
-        } else {
-            None
         }
     }
 
@@ -306,28 +358,171 @@ pub trait MontConfig<const N: usize>: 'static + Sync + Send + Sized {
         tmp.0 = r;
         tmp
     }
+
+    #[unroll_for_loops(12)]
+    fn sum_of_products<const M: usize>(
+        a: &[Fp<MontBackend<Self, N>, N>; M],
+        b: &[Fp<MontBackend<Self, N>, N>; M],
+    ) -> Fp<MontBackend<Self, N>, N> {
+        // Adapted from https://github.com/zkcrypto/bls12_381/pull/84 by @str4d.
+
+        // For a single `a x b` multiplication, operand scanning (schoolbook) takes each
+        // limb of `a` in turn, and multiplies it by all of the limbs of `b` to compute
+        // the result as a double-width intermediate representation, which is then fully
+        // reduced at the carry. Here however we have pairs of multiplications (a_i, b_i),
+        // the results of which are summed.
+        //
+        // The intuition for this algorithm is two-fold:
+        // - We can interleave the operand scanning for each pair, by processing the jth
+        //   limb of each `a_i` together. As these have the same offset within the overall
+        //   operand scanning flow, their results can be summed directly.
+        // - We can interleave the multiplication and reduction steps, resulting in a
+        //   single bitshift by the limb size after each iteration. This means we only
+        //   need to store a single extra limb overall, instead of keeping around all the
+        //   intermediate results and eventually having twice as many limbs.
+
+        let modulus_size = Self::MODULUS.const_num_bits() as usize;
+        if modulus_size >= 64 * N - 1 {
+            a.iter().zip(b).map(|(a, b)| *a * b).sum()
+        } else if M == 2 {
+            // Algorithm 2, line 2
+            let result = (0..N).fold(BigInt::zero(), |mut result, j| {
+                // Algorithm 2, line 3
+                let mut carry_a = 0;
+                let mut carry_b = 0;
+                for (a, b) in a.iter().zip(b) {
+                    let a = &a.0;
+                    let b = &b.0;
+                    let mut carry2 = 0;
+                    result.0[0] = fa::mac(result.0[0], a.0[j], b.0[0], &mut carry2);
+                    for k in 1..N {
+                        result.0[k] = fa::mac_with_carry(result.0[k], a.0[j], b.0[k], &mut carry2);
+                    }
+                    carry_b = fa::adc(&mut carry_a, carry_b, carry2);
+                }
+
+                let k = result.0[0].wrapping_mul(Self::INV);
+                let mut carry2 = 0;
+                fa::mac_discard(result.0[0], k, Self::MODULUS.0[0], &mut carry2);
+                for i in 1..N {
+                    result.0[i - 1] =
+                        fa::mac_with_carry(result.0[i], k, Self::MODULUS.0[i], &mut carry2);
+                }
+                result.0[N - 1] = fa::adc_no_carry(carry_a, carry_b, &mut carry2);
+                result
+            });
+            let mut result = Fp::new_unchecked(result);
+            result.subtract_modulus();
+            debug_assert_eq!(
+                a.iter().zip(b).map(|(a, b)| *a * b).sum::<Fp<_, N>>(),
+                result
+            );
+            result
+        } else {
+            let chunk_size = 2 * (N * 64 - modulus_size) - 1;
+            // chunk_size is at least 1, since MODULUS_BIT_SIZE is at most N * 64 - 1.
+            a.chunks(chunk_size)
+                .zip(b.chunks(chunk_size))
+                .map(|(a, b)| {
+                    // Algorithm 2, line 2
+                    let result = (0..N).fold(BigInt::zero(), |mut result, j| {
+                        // Algorithm 2, line 3
+                        let (temp, carry) = a.iter().zip(b).fold(
+                            (result, 0),
+                            |(mut temp, mut carry), (Fp(a, _), Fp(b, _))| {
+                                let mut carry2 = 0;
+                                temp.0[0] = fa::mac(temp.0[0], a.0[j], b.0[0], &mut carry2);
+                                for k in 1..N {
+                                    temp.0[k] =
+                                        fa::mac_with_carry(temp.0[k], a.0[j], b.0[k], &mut carry2);
+                                }
+                                carry = fa::adc_no_carry(carry, 0, &mut carry2);
+                                (temp, carry)
+                            },
+                        );
+
+                        let k = temp.0[0].wrapping_mul(Self::INV);
+                        let mut carry2 = 0;
+                        fa::mac_discard(temp.0[0], k, Self::MODULUS.0[0], &mut carry2);
+                        for i in 1..N {
+                            result.0[i - 1] =
+                                fa::mac_with_carry(temp.0[i], k, Self::MODULUS.0[i], &mut carry2);
+                        }
+                        result.0[N - 1] = fa::adc_no_carry(carry, 0, &mut carry2);
+                        result
+                    });
+                    let mut result = Fp::new_unchecked(result);
+                    result.subtract_modulus();
+                    debug_assert_eq!(
+                        a.iter().zip(b).map(|(a, b)| *a * b).sum::<Fp<_, N>>(),
+                        result
+                    );
+                    result
+                })
+                .sum()
+        }
+    }
 }
 
 /// Compute -M^{-1} mod 2^64.
-pub const fn inv<const N: usize>(m: &BigInt<N>) -> u64 {
+pub const fn inv<T: MontConfig<N>, const N: usize>() -> u64 {
+    // We compute this as follows.
+    // First, MODULUS mod 2^64 is just the lower 64 bits of MODULUS.
+    // Hence MODULUS mod 2^64 = MODULUS.0[0] mod 2^64.
+    //
+    // Next, computing the inverse mod 2^64 involves exponentiating by
+    // the multiplicative group order, which is euler_totient(2^64) - 1.
+    // Now, euler_totient(2^64) = 1 << 63, and so
+    // euler_totient(2^64) - 1 = (1 << 63) - 1 = 1111111... (63 digits).
+    // We compute this powering via standard square and multiply.
     let mut inv = 1u64;
     crate::const_for!((_i in 0..63) {
+        // Square
         inv = inv.wrapping_mul(inv);
-        inv = inv.wrapping_mul(m.0[0]);
+        // Multiply
+        inv = inv.wrapping_mul(T::MODULUS.0[0]);
     });
     inv.wrapping_neg()
 }
 
 #[inline]
-pub const fn can_use_no_carry_optimization<const N: usize>(modulus: &BigInt<N>) -> bool {
+pub const fn can_use_no_carry_mul_optimization<T: MontConfig<N>, const N: usize>() -> bool {
     // Checking the modulus at compile time
-    let first_bit_set = modulus.0[N - 1] >> 63 != 0;
-    // N can be 1, hence we can run into a case with an unused mut.
-    let mut all_bits_set = modulus.0[N - 1] == !0 - (1 << 63);
+    let top_bit_is_zero = T::MODULUS.0[N - 1] >> 62 == 0;
+    let mut all_remaining_bits_are_one = T::MODULUS.0[N - 1] == u64::MAX >> 2;
     crate::const_for!((i in 1..N) {
-        all_bits_set &= modulus.0[N - i - 1] == !0u64;
+        all_remaining_bits_are_one  &= T::MODULUS.0[N - i - 1] == u64::MAX;
     });
-    !(first_bit_set || all_bits_set)
+    top_bit_is_zero && !all_remaining_bits_are_one
+}
+
+#[inline]
+pub const fn can_use_no_carry_square_optimization<T: MontConfig<N>, const N: usize>() -> bool {
+    // Checking the modulus at compile time
+    let top_two_bits_are_zero = T::MODULUS.0[N - 1] >> 62 == 0;
+    let mut all_remaining_bits_are_one = T::MODULUS.0[N - 1] == u64::MAX >> 2;
+    crate::const_for!((i in 1..N) {
+        all_remaining_bits_are_one  &= T::MODULUS.0[N - i - 1] == u64::MAX;
+    });
+    top_two_bits_are_zero && !all_remaining_bits_are_one
+}
+
+pub const fn sqrt_precomputation<const N: usize, T: MontConfig<N>>(
+) -> Option<SqrtPrecomputation<Fp<MontBackend<T, N>, N>>> {
+    match T::MODULUS.mod_4() {
+        3 => match T::MODULUS_PLUS_ONE_DIV_FOUR.as_ref() {
+            Some(BigInt(modulus_plus_one_div_four)) => Some(SqrtPrecomputation::Case3Mod4 {
+                modulus_plus_one_div_four,
+            }),
+            None => None,
+        },
+        _ => Some(SqrtPrecomputation::TonelliShanks {
+            two_adicity: <MontBackend<T, N>>::TWO_ADICITY,
+            quadratic_nonresidue_to_trace: T::TWO_ADIC_ROOT_OF_UNITY,
+            trace_of_modulus_minus_one_div_two:
+                &<Fp<MontBackend<T, N>, N>>::TRACE_MINUS_ONE_DIV_TWO.0,
+        }),
+    }
 }
 
 /// Construct a [`Fp<MontBackend<T, N>, N>`] element from a literal string. This
@@ -408,6 +603,10 @@ impl<T: MontConfig<N>, const N: usize> FpConfig<N> for MontBackend<T, N> {
         T::double_in_place(a)
     }
 
+    fn neg_in_place(a: &mut Fp<Self, N>) {
+        T::neg_in_place(a)
+    }
+
     /// This modular multiplication algorithm uses Montgomery
     /// reduction for efficient implementation. It also additionally
     /// uses the "no-carry optimization" outlined
@@ -417,6 +616,10 @@ impl<T: MontConfig<N>, const N: usize> FpConfig<N> for MontBackend<T, N> {
     #[inline]
     fn mul_assign(a: &mut Fp<Self, N>, b: &Fp<Self, N>) {
         T::mul_assign(a, b)
+    }
+
+    fn sum_of_products<const M: usize>(a: &[Fp<Self, N>; M], b: &[Fp<Self, N>; M]) -> Fp<Self, N> {
+        T::sum_of_products(a, b)
     }
 
     #[inline]
@@ -441,6 +644,13 @@ impl<T: MontConfig<N>, const N: usize> FpConfig<N> for MontBackend<T, N> {
 }
 
 impl<T: MontConfig<N>, const N: usize> Fp<MontBackend<T, N>, N> {
+    #[doc(hidden)]
+    pub const R: BigInt<N> = T::R;
+    #[doc(hidden)]
+    pub const R2: BigInt<N> = T::R2;
+    #[doc(hidden)]
+    pub const INV: u64 = T::INV;
+
     /// Construct a new field element from its underlying
     /// [`struct@BigInt`] data type.
     #[inline]
@@ -497,7 +707,7 @@ impl<T: MontConfig<N>, const N: usize> Fp<MontBackend<T, N>, N> {
         }
     }
 
-    const fn mul_without_reduce(mut self, other: &Self) -> Self {
+    const fn mul_without_cond_subtract(mut self, other: &Self) -> Self {
         let (mut lo, mut hi) = ([0u64; N], [0u64; N]);
         crate::const_for!((i in 0..N) {
             let mut carry = 0;
@@ -515,8 +725,8 @@ impl<T: MontConfig<N>, const N: usize> Fp<MontBackend<T, N>, N> {
         let mut carry2 = 0;
         crate::const_for!((i in 0..N) {
             let tmp = lo[i].wrapping_mul(T::INV);
-            let mut carry = 0;
-            mac_with_carry!(lo[i], tmp, T::MODULUS.0[0], &mut carry);
+            let mut carry;
+            mac!(lo[i], tmp, T::MODULUS.0[0], &mut carry);
             crate::const_for!((j in 1..N) {
                 let k = i + j;
                 if k >= N {
@@ -525,8 +735,7 @@ impl<T: MontConfig<N>, const N: usize> Fp<MontBackend<T, N>, N> {
                     lo[k] = mac_with_carry!(lo[k], tmp, T::MODULUS.0[j], &mut carry);
                 }
             });
-            hi[i] = adc!(hi[i], carry2, &mut carry);
-            carry2 = carry;
+            hi[i] = adc!(hi[i], carry, &mut carry2);
         });
 
         crate::const_for!((i in 0..N) {
@@ -536,8 +745,8 @@ impl<T: MontConfig<N>, const N: usize> Fp<MontBackend<T, N>, N> {
     }
 
     const fn mul(mut self, other: &Self) -> Self {
-        self = self.mul_without_reduce(other);
-        self.const_reduce()
+        self = self.mul_without_cond_subtract(other);
+        self.const_subtract_modulus()
     }
 
     const fn const_is_valid(&self) -> bool {
@@ -552,7 +761,7 @@ impl<T: MontConfig<N>, const N: usize> Fp<MontBackend<T, N>, N> {
     }
 
     #[inline]
-    const fn const_reduce(mut self) -> Self {
+    const fn const_subtract_modulus(mut self) -> Self {
         if !self.const_is_valid() {
             self.0 = Self::sub_with_borrow(&self.0, &T::MODULUS);
         }
@@ -562,9 +771,4 @@ impl<T: MontConfig<N>, const N: usize> Fp<MontBackend<T, N>, N> {
     const fn sub_with_borrow(a: &BigInt<N>, b: &BigInt<N>) -> BigInt<N> {
         a.const_sub_with_borrow(b).0
     }
-}
-
-impl<T: MontConfig<N>, const N: usize> Fp<MontBackend<T, N>, N> {
-    pub const R2: BigInt<N> = T::R2;
-    pub const INV: u64 = T::INV;
 }
